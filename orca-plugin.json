@@ -1,0 +1,146 @@
+{
+  "$schema": "https://raw.githubusercontent.com/stablyai/orca/main/docs/schemas/plugins/orca-plugin.v2.schema.json",
+  "manifestVersion": 2,
+  "execution": "trusted-worker",
+  "id": "agent-trace",
+  "name": "Agent Trace",
+  "version": "0.2.0",
+  "description": "A live, animated run view of your agents: every active workspace as a tree of agents and subagents with state, model, tokens, estimated cost and duration, over a trace timeline and an event log. Any agent Orca runs shows its state and tool calls; local Claude Code and Codex transcripts add tokens, cost and subagents. Read-only and local: no network.",
+  "author": {
+    "name": "Leonardo Larrea",
+    "url": "https://github.com/jalarrea2"
+  },
+  "repository": "https://github.com/jalarrea2/orca-agent-trace",
+  "license": "MIT",
+  "icon": "assets/icon.png",
+  "cover": {
+    "path": "assets/cover.png",
+    "alt": "Agent Trace showing two active workspaces as a tree of agent cards above a trace timeline, drawn from sample data"
+  },
+  "screenshots": [
+    {
+      "path": "assets/cover.png",
+      "alt": "All active workspaces: a tree of workspaces, agents and subagents with state, cost and duration, over a trace timeline (sample data)"
+    },
+    {
+      "path": "assets/workspace-light.png",
+      "alt": "One workspace in the light theme: five agents side by side, with model turns, tool calls and a failed call on the timeline (sample data)"
+    },
+    {
+      "path": "assets/tokens-dark.png",
+      "alt": "The Tokens and cost tab: input, output and cache tokens and estimated cost per agent, grouped by workspace (sample data)"
+    }
+  ],
+  "engines": {
+    "orca": ">=1.4.248"
+  },
+  "pluginApi": 1,
+  "main": "src/worker.mjs",
+  "contributes": {
+    "panels": [
+      {
+        "id": "trace",
+        "title": "Agent Trace",
+        "icon": "activity",
+        "entry": "view/index.html"
+      }
+    ],
+    "customEditors": [
+      {
+        "id": "trace-tab",
+        "title": "Agent Trace",
+        "extensions": [
+          ".agenttrace"
+        ],
+        "entry": "view/editor.html",
+        "frame": "isolated"
+      }
+    ],
+    "newFiles": [
+      {
+        "id": "trace-view",
+        "title": "New Agent Trace view",
+        "extension": ".agenttrace",
+        "template": "templates/blank.agenttrace"
+      }
+    ],
+    "commands": [
+      {
+        "id": "toggleSidebar",
+        "title": "Agent Trace: Show or hide the right sidebar",
+        "action": "sidebar.right.toggle"
+      }
+    ],
+    "events": [
+      {
+        "on": "agent.status.changed"
+      },
+      {
+        "on": "workspace.changed"
+      }
+    ],
+    "hooks": [
+      {
+        "event": "agent.tool.after"
+      }
+    ],
+    "settings": [
+      {
+        "key": "rangeHours",
+        "title": "Default time range",
+        "description": "How far back a view looks when it opens.",
+        "type": "integer",
+        "default": 6,
+        "enum": [
+          1,
+          6,
+          24,
+          168
+        ],
+        "enumLabels": [
+          "Last hour",
+          "Last 6 hours",
+          "Last 24 hours",
+          "Last 7 days"
+        ]
+      },
+      {
+        "key": "toolLabels",
+        "title": "Show tool call labels",
+        "description": "Label each tool call with its file name, command start or web host. Off keeps only the tool's name.",
+        "type": "boolean",
+        "default": true
+      },
+      {
+        "key": "claudeDir",
+        "title": "Claude Code folder",
+        "description": "The folder that holds Claude Code's projects directory. Empty uses ~/.claude.",
+        "type": "string",
+        "default": "",
+        "placeholder": "~/.claude"
+      },
+      {
+        "key": "codexDir",
+        "title": "Codex folder",
+        "description": "The folder that holds Codex's sessions directory. Empty uses ~/.codex.",
+        "type": "string",
+        "default": "",
+        "placeholder": "~/.codex"
+      }
+    ]
+  },
+  "capabilities": [
+    {
+      "kind": "agent:read"
+    },
+    {
+      "kind": "workspace:read"
+    },
+    {
+      "kind": "storage:own"
+    },
+    {
+      "kind": "settings:own"
+    }
+  ]
+}
