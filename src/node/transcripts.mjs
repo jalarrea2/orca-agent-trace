@@ -2,12 +2,14 @@
 // bytes added since the last pass. Node only.
 import { open, readdir, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join, sep } from 'node:path';
+import { isAbsolute, join, normalize, sep } from 'node:path';
 import { createClaudeParser } from '../core/adapters/claude.mjs';
 import { createCodexParser } from '../core/adapters/codex.mjs';
 
 const CHUNK = 1024 * 1024;
 const HEAD_BYTES = 512 * 1024;
+// A transcript line longer than this is skipped instead of being held in memory.
+const MAX_LINE_BYTES = 32 * 1024 * 1024;
 // A session not asked for in this long is dropped from memory.
 const IDLE_MS = 30 * 60_000;
 const MAX_SESSIONS = 300;
@@ -21,8 +23,8 @@ export function claudeProjectDirNames(cwd) {
 }
 
 export function createTranscriptReader({ home = homedir(), claudeDir = '', codexDir = '', cost = () => null, toolLabels = true, now = () => Date.now() } = {}) {
-  const claudeRoot = claudeDir || join(home, '.claude');
-  const codexRoot = codexDir || join(home, '.codex');
+  const claudeRoot = resolveRoot(claudeDir, home) ?? join(home, '.claude');
+  const codexRoot = resolveRoot(codexDir, home) ?? join(home, '.codex');
   const sessions = new Map(); // `${kind}:${sessionId}` → { kind, parser, offsets: Map(file → bytes read), usedAt }
   const codexHeads = new Map(); // file → { cwd, id } read once from its session_meta line
 
@@ -53,20 +55,32 @@ export function createTranscriptReader({ home = homedir(), claudeDir = '', codex
     try {
       const buffer = Buffer.allocUnsafe(CHUNK);
       let pending = Buffer.alloc(0);
+      let skipping = false; // inside a line that went over MAX_LINE_BYTES: drop bytes up to its newline
       while (offset < size) {
         const { bytesRead } = await handle.read(buffer, 0, Math.min(CHUNK, size - offset), offset);
         if (bytesRead === 0) break;
         offset += bytesRead;
-        const data = Buffer.concat([pending, buffer.subarray(0, bytesRead)]);
+        let chunk = buffer.subarray(0, bytesRead);
+        if (skipping) {
+          const end = chunk.indexOf(0x0a);
+          if (end < 0) continue;
+          chunk = chunk.subarray(end + 1);
+          skipping = false;
+        }
+        const data = Buffer.concat([pending, chunk]);
         const newline = data.lastIndexOf(0x0a);
         if (newline < 0) {
-          pending = data;
+          if (data.length > MAX_LINE_BYTES) {
+            pending = Buffer.alloc(0);
+            skipping = true;
+          } else pending = data;
           continue;
         }
         for (const line of data.subarray(0, newline).toString('utf8').split('\n')) if (line) item.parser.push(line);
         pending = Buffer.from(data.subarray(newline + 1));
       }
-      item.offsets.set(file, offset - pending.length);
+      // An oversized line still being written is skipped for good: the next pass starts after it.
+      item.offsets.set(file, skipping ? offset : offset - pending.length);
     } finally {
       await handle.close();
     }
@@ -225,12 +239,26 @@ async function codexHead(file) {
       // A first line longer than HEAD_BYTES: fall back to picking the two fields out of the text.
       const cwd = /"cwd":"((?:[^"\\]|\\.)*)"/.exec(line);
       const id = /"id":"([^"\\]+)"/.exec(line);
-      if (cwd) return { cwd: JSON.parse(`"${cwd[1]}"`), id: id ? id[1] : '' };
+      try {
+        if (cwd) return { cwd: JSON.parse(`"${cwd[1]}"`), id: id ? id[1] : '' };
+      } catch {
+        // not a JSON string after all: this file is not a rollout this reader understands
+      }
     }
     return null;
   } finally {
     await handle.close();
   }
+}
+
+// The folder a setting names, or null to use the default. `~` is the home folder. A relative path
+// is refused: it would be read against whatever folder the worker happens to run in.
+export function resolveRoot(setting, home = homedir()) {
+  let path = typeof setting === 'string' ? setting.trim() : '';
+  if (!path || path.includes('\0')) return null;
+  if (path === '~') path = home;
+  else if (path.startsWith('~/') || path.startsWith('~\\')) path = join(home, path.slice(2));
+  return isAbsolute(path) ? normalize(path) : null;
 }
 
 function sameOrInside(path, root) {

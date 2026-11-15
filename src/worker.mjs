@@ -6,7 +6,7 @@ import { createLiveStore } from './core/live.mjs';
 import { requestCost } from './core/pricing.mjs';
 import { PRICES_AS_OF } from './core/prices-data.mjs';
 import { buildFleetSnapshot, buildSnapshot } from './core/snapshot.mjs';
-import { createTranscriptReader } from './node/transcripts.mjs';
+import { createTranscriptReader, resolveRoot } from './node/transcripts.mjs';
 
 const STORE_KEY = 'live-v1';
 const ALIASES_KEY = 'aliases-v1';
@@ -95,6 +95,9 @@ export async function start(orca, { now = () => Date.now(), home, persistMs = 5_
       codexDir: typeof raw.codexDir === 'string' ? raw.codexDir.trim() : '',
       toolLabels: raw.toolLabels !== false,
     };
+    for (const name of ['claudeDir', 'codexDir']) {
+      if (settings[name] && !resolveRoot(settings[name], home)) warnOnce(`${name}:${settings[name]}`, `the ${name} setting is not an absolute path, so the default folder is used`);
+    }
     const key = JSON.stringify([settings.claudeDir, settings.codexDir, settings.toolLabels]);
     if (!reader || key !== readerKey) {
       readerKey = key;

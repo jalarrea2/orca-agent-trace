@@ -7,17 +7,23 @@
 //   - `event_msg` with payload.type `token_count` gives info.last_token_usage and total_token_usage
 //   - `response_item` function_call / custom_tool_call opens a call (call_id);
 //     function_call_output / custom_tool_call_output closes it
+import { contentText, orchIds, parseOrchCommand } from './orch.mjs';
 import {
-  addUsage, clip, count, createAgent, isObject, parseJsonObject, pushEvent, pushSpan, str, toolLabel, touch,
+  addUsage, clip, count, createAgent, isObject, parseJsonObject, pushEvent, pushFlow, pushSpan, safeClip, str, toolLabel, touch,
 } from './shared.mjs';
 
 const CALL_KINDS = new Set(['function_call', 'custom_tool_call', 'local_shell_call']);
 const OUTPUT_KINDS = new Set(['function_call_output', 'custom_tool_call_output', 'local_shell_call_output']);
+const MAX_NAME = 100; // model and tool names are identifiers: anything longer is cut
 
 export function createCodexParser({ sessionId = '', cost = () => null, toolLabels = true } = {}) {
   const main = createAgent('');
   const openTools = new Map();
   const events = [];
+  const prompts = [];
+  const orch = [];
+  const orchCalls = new Map();
+  let inboundIds = null;
   let sid = sessionId;
   let cwd = '';
   let title = '';
@@ -34,18 +40,31 @@ export function createCodexParser({ sessionId = '', cost = () => null, toolLabel
   function responseItem(payload, ts) {
     if (CALL_KINDS.has(payload.type)) {
       grow(ts);
-      const name = str(payload.name) || (payload.type === 'local_shell_call' ? 'shell' : 'tool');
+      const name = clip(str(payload.name), MAX_NAME) || (payload.type === 'local_shell_call' ? 'shell' : 'tool');
       const args = parseArgs(payload.arguments ?? payload.action);
       const span = pushSpan(main, { kind: 'tool', name, label: toolLabel(args, toolLabels), start: ts, end: null, error: false });
       main.toolCount += 1;
       const id = str(payload.call_id) || str(payload.id);
       if (id) openTools.set(id, span);
+      const command = parseOrchCommand(args.command ?? args.cmd, toolLabels);
+      if (command) {
+        span.orch = true;
+        const record = { ts, agentKey: '', verb: command.verb, ids: command.ids, subject: command.subject, error: false };
+        pushFlow(orch, record);
+        if (id) orchCalls.set(id, record);
+      }
     } else if (OUTPUT_KINDS.has(payload.type)) {
       const id = str(payload.call_id) || str(payload.id);
       const span = id ? openTools.get(id) : null;
       if (span) {
         span.end = Math.max(span.start, ts);
         openTools.delete(id);
+      }
+      const record = id ? orchCalls.get(id) : null;
+      if (record) {
+        const output = typeof payload.output === 'string' ? payload.output.slice(0, 8000) : contentText(payload.output?.content ?? payload.output);
+        for (const found of orchIds(output)) if (!record.ids.includes(found) && record.ids.length < 24) record.ids.push(found);
+        orchCalls.delete(id);
       }
       llm = null;
     } else if (payload.type === 'reasoning') {
@@ -54,10 +73,14 @@ export function createCodexParser({ sessionId = '', cost = () => null, toolLabel
       if (payload.role === 'assistant') grow(ts);
       else if (payload.role === 'user') {
         llm = null;
-        const text = clip(firstText(payload.content), 140);
+        const full = firstText(payload.content);
+        const text = safeClip(full, 140);
         // Codex puts AGENTS.md and tagged context in user messages before the first prompt.
         if (text && !text.startsWith('<') && !text.startsWith('# AGENTS.md')) {
+          const ids = orchIds(full);
+          if (inboundIds === null) inboundIds = ids;
           if (!title) title = clip(text, 80);
+          pushFlow(prompts, { ts, agentKey: '', text: toolLabels ? clip(text, 100) : '', ids });
           pushEvent(events, { ts, agentKey: '', level: 'info', text: `Prompt: ${text}` });
         }
       }
@@ -90,7 +113,7 @@ export function createCodexParser({ sessionId = '', cost = () => null, toolLabel
         if (str(payload.id) && !sid) sid = payload.id;
         if (str(payload.cwd)) cwd = payload.cwd;
       } else if (obj.type === 'turn_context') {
-        if (str(payload.model)) model = main.model = payload.model;
+        if (str(payload.model)) model = main.model = clip(payload.model, MAX_NAME);
         if (str(payload.cwd)) cwd = payload.cwd;
       }
       if (!Number.isFinite(ts)) return;
@@ -99,7 +122,7 @@ export function createCodexParser({ sessionId = '', cost = () => null, toolLabel
       else if (obj.type === 'compacted') pushEvent(events, { ts, agentKey: '', level: 'info', text: 'Context compacted' });
       else if (obj.type === 'event_msg' && (payload.type === 'error' || payload.type === 'stream_error')) {
         main.errorCount += 1;
-        pushEvent(events, { ts, agentKey: '', level: 'error', text: clip(str(payload.message) || 'Error', 140) });
+        pushEvent(events, { ts, agentKey: '', level: 'error', text: safeClip(str(payload.message) || 'Error', 140) });
       } else if (obj.type !== 'session_meta' && obj.type !== 'turn_context') return;
       touch(main, ts);
       lastTs = ts;
@@ -107,7 +130,10 @@ export function createCodexParser({ sessionId = '', cost = () => null, toolLabel
 
     result() {
       main.name = title || 'Session';
-      return { agentKind: 'codex', sessionId: sid, cwd, title, agents: [main], events: [...events], openTools: openTools.size };
+      return {
+        agentKind: 'codex', sessionId: sid, cwd, title, agents: [main], events: [...events],
+        prompts: [...prompts], orch: [...orch], inboundIds: inboundIds ?? [], openTools: openTools.size,
+      };
     },
   };
 }

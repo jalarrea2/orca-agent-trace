@@ -12,6 +12,13 @@
         <select id="ws" aria-label="Workspace"></select>
         <span id="branch" class="branch"></span>
         <span id="live" class="badge live" hidden>LIVE</span>
+        <span class="seg" role="group" aria-label="View">
+          <button id="view-tree" class="segb" aria-pressed="true" title="Agents as a tree">Tree</button>
+          <button id="view-seq" class="segb" aria-pressed="false" title="Messages between agents, in order">Sequence</button>
+        </span>
+        <select id="seq-ws" aria-label="Workspace shown in the sequence" hidden></select>
+        <label id="seq-tools-wrap" class="check" hidden><input type="checkbox" id="seq-tools" /> Tool calls</label>
+        <button id="seq-focus" class="chip-x" title="Show every agent again" hidden></button>
         <span class="spacer"></span>
         <select id="range" aria-label="Time range"></select>
       </header>

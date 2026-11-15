@@ -4,8 +4,8 @@
   "execution": "trusted-worker",
   "id": "agent-trace",
   "name": "Agent Trace",
-  "version": "0.2.0",
-  "description": "A live, animated run view of your agents: every active workspace as a tree of agents and subagents with state, model, tokens, estimated cost and duration, over a trace timeline and an event log. Any agent Orca runs shows its state and tool calls; local Claude Code and Codex transcripts add tokens, cost and subagents. Read-only and local: no network.",
+  "version": "0.3.0",
+  "description": "A live, animated run view of your agents: every active workspace as a tree of agents and subagents with state, model, tokens, estimated cost and duration, a sequence diagram of the messages between agents, a trace timeline and an event log. Any agent Orca runs shows its state and tool calls; local Claude Code and Codex transcripts add tokens, cost, subagents and orchestration. Read-only and local: no network.",
   "author": {
     "name": "Leonardo Larrea",
     "url": "https://github.com/jalarrea2"
@@ -21,6 +21,10 @@
     {
       "path": "assets/cover.png",
       "alt": "All active workspaces: a tree of workspaces, agents and subagents with state, cost and duration, over a trace timeline (sample data)"
+    },
+    {
+      "path": "assets/sequence-dark.png",
+      "alt": "The Sequence view: one lane per agent, arrows for prompts, subagent calls and orchestration messages between agents in two workspaces (sample data)"
     },
     {
       "path": "assets/workspace-light.png",

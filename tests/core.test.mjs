@@ -231,3 +231,131 @@ test('fleet: only active workspaces, the ones that need the person first', () =>
   assert.equal(none.live, false);
   assert.equal(none.range.start, null);
 });
+
+test('orchestration: commands and ids are read from shell calls', async () => {
+  const { orchIds, parseOrchCommand } = await import('../src/core/adapters/orch.mjs');
+  assert.deepEqual(orchIds('task: task_91be04 dispatch: ctx_7f3a2c, see task_id and run_home, again ctx_7f3a2c'), ['task_91be04', 'ctx_7f3a2c']);
+  assert.equal(parseOrchCommand('git status'), null);
+  assert.equal(parseOrchCommand('echo orca orchestration'), null);
+  assert.deepEqual(parseOrchCommand('cd x && orca orchestration worker-start --spec "Fix the rounding" --worktree new-child --agent codex'), { verb: 'worker-start', ids: [], subject: 'Fix the rounding' });
+  assert.deepEqual(parseOrchCommand("orca-dev orchestration send --to dispatch:ctx_7f3a2c --type worker_done --subject 'Rounding fixed'"), { verb: 'worker-done', ids: ['ctx_7f3a2c'], subject: 'Rounding fixed' });
+  assert.deepEqual(parseOrchCommand('orca orchestration reply --id msg_4411aa --body "secret"', false), { verb: 'reply', ids: ['msg_4411aa'], subject: '' });
+});
+
+test('messages: agents are paired through orchestration ids, across workspaces', () => {
+  const at = (seconds) => NOW - 100_000 + seconds * 1000;
+  const lead = createClaudeParser({ cost: requestCost });
+  const leadBase = { sessionId: 'lead', cwd: '/a' };
+  const push = (parser, line) => parser.push(JSON.stringify(line));
+  const say = (ts, base, text) => ({ type: 'user', timestamp: new Date(ts).toISOString(), ...base, message: { role: 'user', content: text } });
+  const bash = (ts, base, id, command) => ({ type: 'assistant', timestamp: new Date(ts).toISOString(), ...base, message: { id: `m-${id}`, model: 'claude-opus-5-5', content: [{ type: 'tool_use', id, name: 'Bash', input: { command } }], usage: { input_tokens: 1, output_tokens: 1 } } });
+  const result = (ts, base, id, content) => ({ type: 'user', timestamp: new Date(ts).toISOString(), ...base, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content }] } });
+  push(lead, say(at(0), leadBase, 'Ship the invoice fix'));
+  push(lead, bash(at(5), leadBase, 'o1', 'orca orchestration worker-start --spec "Fix rounding" --worktree new-child --agent codex'));
+  push(lead, result(at(7), leadBase, 'o1', 'task: task_91be04\ndispatch: ctx_7f3a2c'));
+  push(lead, say(at(40), leadBase, '[Orca] Question from dispatch ctx_7f3a2c (msg_4411aa): half-even?'));
+  push(lead, bash(at(44), leadBase, 'o2', 'orca orchestration reply --id msg_4411aa --body "Half-even"'));
+  push(lead, result(at(45), leadBase, 'o2', 'ok'));
+  push(lead, bash(at(80), leadBase, 'o3', 'orca orchestration check --wait'));
+
+  const worker = createCodexParser({ cost: requestCost });
+  const line = (ts, type, payload) => worker.push(JSON.stringify({ timestamp: new Date(ts).toISOString(), type, payload }));
+  line(at(9), 'session_meta', { id: 'wrk', cwd: '/b' });
+  line(at(9), 'response_item', { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Task task_91be04 · Dispatch ctx_7f3a2c. Fix rounding' }] });
+  line(at(30), 'response_item', { type: 'function_call', name: 'shell_command', call_id: 'c1', arguments: JSON.stringify({ command: 'orca orchestration ask --body "half-even?"' }) });
+  line(at(46), 'response_item', { type: 'function_call_output', call_id: 'c1', output: 'messageId: msg_4411aa' });
+  line(at(70), 'response_item', { type: 'function_call', name: 'shell_command', call_id: 'c2', arguments: JSON.stringify({ command: 'orca orchestration send --to dispatch:ctx_7f3a2c --type worker_done --subject "Rounding fixed"' }) });
+  line(at(71), 'response_item', { type: 'function_call_output', call_id: 'c2', output: 'ok' });
+
+  const leadSession = lead.result();
+  const workerSession = worker.result();
+  assert.deepEqual(workerSession.inboundIds, ['task_91be04', 'ctx_7f3a2c']);
+  assert.deepEqual(leadSession.orch.map((item) => item.verb), ['worker-start', 'reply', 'check']);
+  assert.deepEqual(leadSession.orch[0].ids, ['task_91be04', 'ctx_7f3a2c'], 'ids come from the command result');
+
+  const view = buildFleetSnapshot({
+    groups: [
+      { workspace: { id: 'a', name: 'checkout', branch: '' }, sessions: [leadSession], panes: [] },
+      { workspace: { id: 'b', name: 'billing', branch: '' }, sessions: [workerSession], panes: [] },
+    ],
+    now: NOW, since: NOW - 3_600_000,
+  });
+  const flow = view.messages.map((message) => `${message.from} > ${message.to} ${message.kind}:${message.verb || 'prompt'}`);
+  assert.deepEqual(flow, [
+    'you > s:lead prompt:prompt',
+    's:lead > s:wrk orch:worker-start',
+    // the worker's first prompt is that dispatch arriving, and the question reaching the
+    // coordinator is the worker's ask arriving: neither is drawn twice
+    's:wrk > s:lead orch:ask',
+    's:lead > s:wrk orch:reply',
+    's:wrk > s:lead orch:worker-done',
+    's:lead > orca orch:check',
+  ]);
+  assert.ok(view.spans.some((span) => span.orch && span.nodeId === 's:lead'));
+
+  // Alone, the worker's dispatch has no agent behind it: it comes from Orca.
+  const alone = buildSnapshot({ workspace: { id: 'b', name: 'billing', branch: '' }, sessions: [workerSession], now: NOW, since: NOW - 3_600_000 });
+  assert.deepEqual(alone.messages.map((message) => `${message.from} > ${message.to}`), ['orca > s:wrk', 's:wrk > orca', 's:wrk > orca']);
+});
+
+test('sequence: lanes, grouped tool rows, subagent calls and frames', async () => {
+  const { buildSequence, toolLane } = await import('../view/sequence.js');
+  assert.deepEqual(toolLane('mcp__github__create_pr'), ['tool:mcp:github', 'github']);
+  assert.deepEqual(toolLane('Bash'), ['tool:shell', 'Shell']);
+  assert.deepEqual(toolLane('Read'), ['tool:files', 'Files']);
+  const sessions = demo.claudeSessions.map(parseClaude);
+  const store = createLiveStore();
+  for (const payload of demo.statusEvents) store.onStatus(payload);
+  store.seed(demo.agents, demo.workspace.id, NOW);
+  const view = buildSnapshot({ workspace: demo.workspace, sessions, panes: store.panes(), now: NOW, since: NOW - 3_600_000 });
+  const sequence = buildSequence(view, { now: NOW, tools: true });
+  const labels = sequence.lanes.map((lane) => lane.label);
+  assert.equal(labels[0], 'You');
+  assert.ok(labels.includes('Webhook retry') && labels.includes('Map webhook call sites') && labels.includes('Shell') && labels.includes('Files'));
+  assert.ok(sequence.rows.every((row) => row.a !== row.b && row.index >= 0));
+  assert.ok(sequence.rows.every((row, index) => index === 0 || row.ts >= sequence.rows[index - 1].ts), 'rows are in time order');
+  const main = view.nodes.find((node) => node.id === 's:sess-main');
+  const explore = view.nodes.find((node) => node.name === 'Map webhook call sites');
+  assert.ok(sequence.rows.some((row) => row.kind === 'call' && row.from === main.id && row.to === explore.id));
+  assert.ok(sequence.rows.some((row) => row.kind === 'return' && row.from === explore.id && row.to === main.id));
+  assert.ok(sequence.rows.some((row) => row.kind === 'prompt' && row.from === 'you' && row.to === main.id));
+  assert.ok(sequence.rows.some((row) => row.kind === 'needs-you' && row.to === 'you'));
+  assert.ok(sequence.rows.some((row) => row.kind === 'failed' && row.tool === 'Bash' && row.label.includes('failed')));
+  assert.ok(sequence.rows.some((row) => row.count > 1 && /^\d+ calls · /.test(row.label)), 'adjacent calls to one lane share a row');
+  assert.ok(sequence.activations.some((act) => act.live), 'a running agent stays active to the end');
+
+  const quiet = buildSequence(view, { now: NOW, tools: false });
+  assert.ok(!quiet.lanes.some((lane) => lane.kind === 'tool'));
+  assert.ok(quiet.rows.length < sequence.rows.length);
+  const focused = buildSequence(view, { now: NOW, tools: false, focusId: explore.id });
+  assert.ok(focused.lanes.every((lane) => lane.kind !== 'agent' || lane.id === main.id), 'only the session of the focused agent');
+});
+
+test('sequence: PAR frames overlapping subagents and RETRY frames a failed call tried again', async () => {
+  const { buildSequence } = await import('../view/sequence.js');
+  const node = (fields) => ({ parentId: null, kind: 'agent', group: 'Claude Code', agent: 'claude', name: '', state: 'done', startedAt: 0, endedAt: 100, model: '', ...fields });
+  const snapshot = {
+    scope: 'workspace',
+    nodes: [
+      node({ id: 'root', kind: 'workspace', name: 'w' }),
+      node({ id: 'a', parentId: 'root', name: 'Lead' }),
+      node({ id: 'a:1', parentId: 'a', kind: 'subagent', group: 'Explore', name: 'Find cause', startedAt: 10, endedAt: 40 }),
+      node({ id: 'a:2', parentId: 'a', kind: 'subagent', group: 'general-purpose', name: 'Prepare branch', startedAt: 12, endedAt: 30 }),
+      node({ id: 'a:3', parentId: 'a', kind: 'subagent', group: 'general-purpose', name: 'Later', startedAt: 60, endedAt: 70 }),
+    ],
+    spans: [
+      { nodeId: 'a', kind: 'tool', name: 'mcp__vercel__deploy_preview', label: '', start: 80, end: 85, error: true, open: false },
+      { nodeId: 'a', kind: 'tool', name: 'mcp__vercel__deploy_preview', label: '', start: 90, end: 95, error: false, open: false },
+    ],
+    events: [],
+    messages: [{ ts: 1, from: 'you', to: 'a', kind: 'prompt', verb: '', label: 'Fix the crash', error: false }],
+  };
+  const sequence = buildSequence(snapshot, { now: 100, tools: true });
+  assert.deepEqual(sequence.lanes.map((lane) => lane.label), ['You', 'Lead', 'Find cause', 'Prepare branch', 'Later', 'vercel']);
+  assert.deepEqual(sequence.rows.map((row) => row.kind), ['prompt', 'call', 'call', 'return', 'return', 'call', 'return', 'failed', 'tool']);
+  const par = sequence.frames.find((frame) => frame.tag === 'PAR');
+  assert.deepEqual([par.top, par.bottom, par.left, par.right], [1, 4, 1, 3], 'the two overlapping subagents, not the later one');
+  const retry = sequence.frames.find((frame) => frame.tag === 'RETRY');
+  assert.deepEqual([retry.top, retry.bottom, retry.left, retry.right], [7, 8, 1, 5]);
+  assert.equal(sequence.frames.length, 2);
+});

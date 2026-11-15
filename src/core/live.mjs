@@ -94,7 +94,7 @@ export function createLiveStore({ maxPanes = 300, maxTransitions = 500, maxTools
       if (!terminalId) return null;
       const pane = ensure(byTerminal.get(terminalId) ?? `t:${terminalId}`);
       bindTerminal(pane, terminalId);
-      if (str(event.agent)) pane.agent = event.agent;
+      if (str(event.agent)) pane.agent = clip(event.agent, 40);
       if (str(event.workspaceId) && !pane.workspaceId) pane.workspaceId = event.workspaceId;
       pane.tools.push({ at: now, tool: clip(str(event.tool) || 'tool', 60), label: toolLabel(event.input, toolLabels) });
       if (pane.tools.length > maxTools) pane.tools.shift();
@@ -109,7 +109,7 @@ export function createLiveStore({ maxPanes = 300, maxTransitions = 500, maxTools
         if (!terminalId) continue;
         const pane = ensure(byTerminal.get(terminalId) ?? `t:${terminalId}`);
         bindTerminal(pane, terminalId);
-        if (str(item.agent)) pane.agent = item.agent;
+        if (str(item.agent)) pane.agent = clip(item.agent, 40);
         if (str(item.title)) pane.title = clip(item.title, 80);
         if (str(item.sessionId)) pane.sessionId = item.sessionId;
         if (str(item.task?.title)) pane.task = clip(item.task.title, 120);
@@ -145,9 +145,16 @@ export function createLiveStore({ maxPanes = 300, maxTransitions = 500, maxTools
         const pane = ensure(saved.key);
         Object.assign(pane, {
           terminalId: '', workspaceId: str(saved.workspaceId), workspaceListId: str(saved.workspaceListId),
-          title: str(saved.title), agent: str(saved.agent), sessionId: str(saved.sessionId), task: str(saved.task),
-          transitions: Array.isArray(saved.transitions) ? saved.transitions.filter((t) => STATES.has(t?.state) && Number.isFinite(t.at)) : [],
-          tools: Array.isArray(saved.tools) ? saved.tools.filter((t) => Number.isFinite(t?.at)) : [],
+          title: clip(str(saved.title), 80), agent: clip(str(saved.agent), 40), sessionId: str(saved.sessionId), task: clip(str(saved.task), 120),
+          // Stored values are rebuilt field by field, so nothing of an unexpected type comes back.
+          transitions: Array.isArray(saved.transitions)
+            ? saved.transitions.filter((t) => STATES.has(t?.state) && Number.isFinite(t.at)).slice(-maxTransitions)
+              .map((t) => (str(t.outcome) ? { at: t.at, state: t.state, outcome: clip(t.outcome, 40) } : { at: t.at, state: t.state }))
+            : [],
+          tools: Array.isArray(saved.tools)
+            ? saved.tools.filter((t) => Number.isFinite(t?.at)).slice(-maxTools)
+              .map((t) => ({ at: t.at, tool: clip(str(t.tool) || 'tool', 60), label: clip(str(t.label), 60) }))
+            : [],
           firstAt: Number.isFinite(saved.firstAt) ? saved.firstAt : null,
           lastAt: Number.isFinite(saved.lastAt) ? saved.lastAt : null,
           aliveAt: Number.isFinite(saved.aliveAt) ? saved.aliveAt : null,

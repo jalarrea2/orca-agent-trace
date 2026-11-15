@@ -6,12 +6,14 @@
 //   - `assistant` lines hold `message.{id,model,usage,content[]}`; one message may span several lines
 //   - a `tool_use` block opens a call; a `tool_result` block in a later `user` line closes it
 //   - the `user` line closing an Agent/Task call may carry `toolUseResult.agentId`
+import { contentText, orchIds, parseOrchCommand } from './orch.mjs';
 import {
-  addUsage, clip, count, createAgent, isObject, parseJsonObject, pushEvent, pushSpan, str, toolLabel, touch,
+  addUsage, clip, count, createAgent, isObject, parseJsonObject, pushEvent, pushFlow, pushSpan, safeClip, str, toolLabel, touch,
 } from './shared.mjs';
 
 const SUBAGENT_TOOLS = new Set(['Agent', 'Task']);
 const SEEN_MAX = 20000;
+const MAX_NAME = 100; // model, tool and subagent-type names are identifiers: anything longer is cut
 
 export function createClaudeParser({ sessionId = '', cost = () => null, toolLabels = true } = {}) {
   const agents = new Map([['', createAgent('')]]);
@@ -21,6 +23,10 @@ export function createClaudeParser({ sessionId = '', cost = () => null, toolLabe
   const lastTs = new Map(); // agent key → timestamp of its previous line
   const lastLlm = new Map(); // agent key → { span, messageId }
   const events = [];
+  const prompts = []; // { ts, agentKey, text, ids }: what was typed or injected into the session
+  const orch = []; // { ts, agentKey, verb, ids, subject, error }: orchestration commands it ran
+  const orchCalls = new Map(); // tool_use id → its orch record, until the result arrives
+  let inboundIds = null; // orchestration ids in the first prompt: set when a coordinator dispatched this session
   let sid = sessionId;
   let cwd = '';
   let title = '';
@@ -37,7 +43,7 @@ export function createClaudeParser({ sessionId = '', cost = () => null, toolLabe
 
   function assistant(obj, agent, ts) {
     const message = isObject(obj.message) ? obj.message : {};
-    const model = str(message.model);
+    const model = clip(str(message.model), MAX_NAME);
     const synthetic = model === '<synthetic>';
     if (model && !synthetic) agent.model = model;
 
@@ -71,16 +77,23 @@ export function createClaudeParser({ sessionId = '', cost = () => null, toolLabe
     for (const block of blocksOf(message.content)) {
       if (block.type !== 'tool_use') continue;
       const id = str(block.id);
-      const name = str(block.name) || 'tool';
+      const name = clip(str(block.name), MAX_NAME) || 'tool';
       const input = isObject(block.input) ? block.input : {};
       const span = pushSpan(agent, { kind: 'tool', name, label: toolLabel(input, toolLabels), start: ts, end: null, error: false });
       agent.toolCount += 1;
       if (id) openTools.set(id, span);
+      const command = name === 'Bash' ? parseOrchCommand(input.command, toolLabels) : null;
+      if (command) {
+        span.orch = true;
+        const record = { ts, agentKey: agent.key, verb: command.verb, ids: command.ids, subject: command.subject, error: false };
+        pushFlow(orch, record);
+        if (id) orchCalls.set(id, record);
+      }
       if (id && SUBAGENT_TOOLS.has(name)) {
         agentCalls.set(id, {
           ownerKey: agent.key,
-          name: clip(str(input.description) || str(input.subagent_type) || 'Subagent', 80),
-          type: str(input.subagent_type),
+          name: safeClip(str(input.description) || str(input.subagent_type) || 'Subagent', 80),
+          type: clip(str(input.subagent_type), MAX_NAME),
           start: ts,
           end: null,
           agentKey: null,
@@ -108,6 +121,13 @@ export function createClaudeParser({ sessionId = '', cost = () => null, toolLabe
         }
         openTools.delete(id);
       }
+      const record = id ? orchCalls.get(id) : null;
+      if (record) {
+        // worker-start and dispatch answer with the ids of what they created.
+        for (const found of orchIds(contentText(block.content))) if (!record.ids.includes(found) && record.ids.length < 24) record.ids.push(found);
+        record.error = block.is_error === true;
+        orchCalls.delete(id);
+      }
       const call = id ? agentCalls.get(id) : null;
       if (call) {
         call.end = ts;
@@ -120,10 +140,15 @@ export function createClaudeParser({ sessionId = '', cost = () => null, toolLabe
       pushEvent(events, { ts, agentKey: agent.key, level: 'info', text: 'Context compacted' });
       return;
     }
-    const text = clip(rest.map((block) => (typeof block.text === 'string' ? block.text : '')).join(' '), 140);
+    const full = rest.map((block) => (typeof block.text === 'string' ? block.text : '')).join(' ');
+    const text = safeClip(full, 140);
     if (!text || text.startsWith('<')) return; // command output and injected context, not a prompt
-    if (agent.key === '' && !title) title = clip(text, 80);
-    if (agent.key === '') pushEvent(events, { ts, agentKey: '', level: 'info', text: `Prompt: ${text}` });
+    if (agent.key !== '') return;
+    const ids = orchIds(full);
+    if (inboundIds === null) inboundIds = ids;
+    if (!title) title = clip(text, 80);
+    pushFlow(prompts, { ts, agentKey: '', text: toolLabels ? clip(text, 100) : '', ids });
+    pushEvent(events, { ts, agentKey: '', level: 'info', text: `Prompt: ${text}` });
   }
 
   return {
@@ -131,7 +156,7 @@ export function createClaudeParser({ sessionId = '', cost = () => null, toolLabe
       const obj = parseJsonObject(line);
       if (!obj) return;
       if (obj.type === 'summary' && str(obj.summary)) {
-        title = clip(obj.summary, 80);
+        title = safeClip(obj.summary, 80);
         return;
       }
       if (str(obj.cwd)) cwd = obj.cwd;
@@ -144,7 +169,7 @@ export function createClaudeParser({ sessionId = '', cost = () => null, toolLabe
       else if (obj.type === 'system' && obj.subtype === 'compact_boundary') {
         pushEvent(events, { ts, agentKey: agent.key, level: 'info', text: 'Context compacted' });
       } else if (obj.type === 'system' && (obj.level === 'error' || obj.subtype === 'api_error')) {
-        pushEvent(events, { ts, agentKey: agent.key, level: 'error', text: clip(str(obj.content) || 'API error', 140) });
+        pushEvent(events, { ts, agentKey: agent.key, level: 'error', text: safeClip(str(obj.content) || 'API error', 140) });
       } else return;
       touch(agent, ts);
       lastTs.set(agent.key, ts);
@@ -182,6 +207,9 @@ export function createClaudeParser({ sessionId = '', cost = () => null, toolLabe
         title,
         agents: [...agents.values()],
         events: [...events],
+        prompts: [...prompts],
+        orch: [...orch],
+        inboundIds: inboundIds ?? [],
         openTools: openTools.size,
       };
     },

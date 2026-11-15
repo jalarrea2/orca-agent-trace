@@ -7,6 +7,7 @@
 // when its HTML changes, and animations are started with a negative delay equal to the page clock
 // (--sync), so a redraw continues an animation instead of restarting it.
 import { fmtClock, fmtCost, fmtDuration, fmtTokens, niceStep, prettyModel } from './format.js';
+import { buildSequence, GUTTER_W, LANE_W, sequenceHtml } from './sequence.js';
 
 const POLL_MS = 3000;
 const TICK_MS = 1000;
@@ -36,6 +37,11 @@ const $ = (id) => document.getElementById(id);
 const api = window.orca;
 const state = {
   workspaceId: FLEET, rangeHours: null, tab: 'trace', selected: null, zoom: 1,
+  view: 'tree', // 'tree' | 'sequence': what the upper region draws
+  seqWorkspace: 'all', // in the all-workspaces scope, the workspace node the sequence shows
+  seqTools: null, // whether the sequence has tool rows; null follows the scope's default
+  seqJump: false, // scroll the sequence to its newest row on the next draw
+  prevAt: null, // when the previous snapshot was taken: rows after it animate in
   data: null, receivedAt: 0, error: null, loading: false, queued: false,
   known: null, // node id → state at the previous snapshot; null before the first one
   fresh: new Set(), // nodes that first appeared in the current snapshot
@@ -45,6 +51,20 @@ const state = {
 function esc(value) {
   return String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
 }
+
+// Every text in the snapshot goes through esc. The values below are not text: a state, kind or
+// level picks a CSS class, and a time or count is a number. They are narrowed here as well, so a
+// value of an unexpected shape can never add markup.
+function tok(value) {
+  return String(value ?? '').replace(/[^A-Za-z0-9-]/g, '');
+}
+
+function num(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
+}
+
+const own = (table, key) => (Object.hasOwn(table, key) ? table[key] : undefined);
 
 // The snapshot's clock, advanced locally while something is running.
 function liveNow() {
@@ -72,6 +92,7 @@ async function load() {
       }
     }
     state.known = next;
+    state.prevAt = state.data ? state.data.snapshot.generatedAt : null;
     state.data = data;
     state.receivedAt = performance.now();
     state.error = null;
@@ -90,8 +111,9 @@ async function load() {
 const drawn = new WeakMap(); // region → the HTML it shows
 const held = new WeakMap(); // region → when a redraw was first held back
 
-// Replaces a region's HTML when it changed. `force` is for the person's own actions.
-function setHtml(element, html, force) {
+// Replaces a region's HTML when it changed. `force` is for the person's own actions; `follow`
+// keeps a region that was scrolled to its end at its end, so new rows stay in sight.
+function setHtml(element, html, force, follow = false) {
   if (drawn.get(element) === html) {
     held.delete(element);
     return;
@@ -103,11 +125,12 @@ function setHtml(element, html, force) {
   }
   held.delete(element);
   const { scrollLeft, scrollTop } = element;
+  const atEnd = element.scrollHeight - scrollTop - element.clientHeight < 48;
   element.style.setProperty('--sync', `-${(performance.now() / 1000).toFixed(3)}s`);
   element.innerHTML = html;
   drawn.set(element, html);
   element.scrollLeft = scrollLeft;
-  element.scrollTop = scrollTop;
+  element.scrollTop = follow && atEnd ? element.scrollHeight : scrollTop;
 }
 
 function render(force = false) {
@@ -122,7 +145,13 @@ function render(force = false) {
   if (!data) return;
   const snapshot = data.snapshot;
   const now = liveNow();
-  setHtml($('graph'), graphHtml(snapshot), force);
+  const sequence = state.view === 'sequence';
+  document.body.classList.toggle('seq-view', sequence);
+  setHtml($('graph'), sequence ? seqHtml(snapshot, now, width) : graphHtml(snapshot), force, sequence);
+  if (sequence && state.seqJump) {
+    state.seqJump = false;
+    $('graph').scrollTop = $('graph').scrollHeight;
+  }
   $('attn').textContent = snapshot.totals.attention ? String(snapshot.totals.attention) : '';
   $('totals').innerHTML = totalsHtml(snapshot, now);
   for (const tab of ['trace', 'tokens', 'events']) {
@@ -155,7 +184,7 @@ function renderBar(data) {
   }
   select.value = state.workspaceId;
   const range = $('range');
-  const ranges = data?.ranges ?? [1, 6, 24, 168];
+  const ranges = (data?.ranges ?? [1, 6, 24, 168]).map(num);
   const rangeHtml = ranges.map((hours) => `<option value="${hours}">${hours < 24 ? `Last ${hours} h` : hours === 24 ? 'Last 24 h' : `Last ${hours / 24} days`}</option>`).join('');
   if (range.dataset.html !== rangeHtml) {
     range.innerHTML = rangeHtml;
@@ -164,10 +193,60 @@ function renderBar(data) {
   if (data) range.value = String(data.rangeHours);
   const snapshot = data?.snapshot;
   const workspace = snapshot?.workspace;
+  renderViewControls(snapshot);
   $('branch').textContent = snapshot?.scope === 'fleet'
-    ? `${snapshot.totals.workspaces} active · ${snapshot.totals.running} running`
+    ? `${num(snapshot.totals.workspaces)} active · ${num(snapshot.totals.running)} running`
     : workspace ? [state.workspaceId === FOCUSED ? workspace.name : '', workspace.branch].filter(Boolean).join(' · ') : '';
   $('live').hidden = !snapshot?.live;
+}
+
+// ---- Sequence ----------------------------------------------------------------------------
+
+// Tool rows are on by default for one workspace and off for all of them, where the point is
+// which agent talked to which.
+function seqToolsOn(snapshot) {
+  return state.seqTools ?? snapshot?.scope !== 'fleet';
+}
+
+function renderViewControls(snapshot) {
+  const sequence = state.view === 'sequence';
+  $('view-tree').setAttribute('aria-pressed', String(!sequence));
+  $('view-seq').setAttribute('aria-pressed', String(sequence));
+  const pick = $('seq-ws');
+  const tops = (snapshot?.nodes ?? []).filter((node) => node.kind === 'workspace');
+  const fleet = snapshot?.scope === 'fleet';
+  const html = `<option value="all">All workspaces</option>${tops.map((node) => `<option value="${esc(node.id)}">${esc(node.name)}</option>`).join('')}`;
+  if (pick.dataset.html !== html) {
+    pick.innerHTML = html;
+    pick.dataset.html = html;
+  }
+  if (!tops.some((node) => node.id === state.seqWorkspace)) state.seqWorkspace = 'all';
+  pick.value = state.seqWorkspace;
+  pick.hidden = !(sequence && fleet && tops.length > 1);
+  $('seq-tools-wrap').hidden = !sequence;
+  $('seq-tools').checked = seqToolsOn(snapshot);
+  const focused = sequence && state.selected ? snapshot?.nodes.find((node) => node.id === state.selected && (node.kind === 'agent' || node.kind === 'subagent')) : null;
+  $('seq-focus').hidden = !focused;
+  if (focused) $('seq-focus').textContent = `✕ ${focused.name}`;
+}
+
+function laneGlyph(lane) {
+  if (lane.kind === 'you') return '<span class="glyph ws" aria-hidden="true">●</span>';
+  if (lane.kind === 'orca') return '<span class="glyph ws" aria-hidden="true">◎</span>';
+  if (lane.kind === 'tool') return '<span class="glyph tool" aria-hidden="true">⚙</span>';
+  return glyph(lane);
+}
+
+function seqHtml(snapshot, now, width) {
+  const sequence = buildSequence(snapshot, {
+    now,
+    focusId: state.selected,
+    workspaceId: snapshot.scope === 'fleet' ? state.seqWorkspace : 'all',
+    tools: seqToolsOn(snapshot),
+  });
+  // Lanes share the width when they fit, down to a floor; past that the diagram scrolls sideways.
+  const laneWidth = Math.max(width < NARROW_PX ? 96 : 112, Math.min(LANE_W, Math.floor((width - GUTTER_W - 6) / Math.max(1, sequence.lanes.length))));
+  return sequenceHtml(sequence, { esc, glyph: laneGlyph, newerThan: state.prevAt, selected: state.selected, laneWidth });
 }
 
 // ---- Graph -------------------------------------------------------------------------------
@@ -183,13 +262,13 @@ function glyph(node) {
 }
 
 function pill(nodeState) {
-  return `<span class="pill s-${nodeState}">${ICON[nodeState] ?? ''}${esc(STATE_LABEL[nodeState] ?? nodeState)}</span>`;
+  return `<span class="pill s-${tok(nodeState)}">${own(ICON, nodeState) ?? ''}${esc(own(STATE_LABEL, nodeState) ?? nodeState)}</span>`;
 }
 
 // A duration that counts up for a running node (filled by fillLive), or a fixed one.
 function durationHtml(node, prefix = '') {
   if (node.startedAt === null) return '';
-  if (node.endedAt === null) return `<span data-live="${node.startedAt}" data-prefix="${esc(prefix)}"></span>`;
+  if (node.endedAt === null) return `<span data-live="${num(node.startedAt)}" data-prefix="${esc(prefix)}"></span>`;
   return `${esc(prefix)}${fmtDuration(Math.max(0, node.endedAt - node.startedAt))}`;
 }
 
@@ -197,11 +276,11 @@ function cardHtml(node, snapshot) {
   const cost = node.total.cost === null ? '' : `<span class="cost" title="Estimated cost${node.total.costPartial ? ', incomplete: some models have no price' : ''}">${fmtCost(node.total.cost)}${node.total.costPartial ? '+' : ''}</span>`;
   const tokens = node.total.tokens ? `${fmtTokens(node.total.tokens)} tok` : '';
   const group = node.kind === 'fleet' || node.kind === 'workspace';
-  const left = group ? `${node.agentCount} ${node.agentCount === 1 ? 'agent' : 'agents'}` : node.model ? prettyModel(node.model) : node.source === 'events' ? 'Events only' : '';
+  const left = group ? `${num(node.agentCount)} ${node.agentCount === 1 ? 'agent' : 'agents'}` : node.model ? prettyModel(node.model) : node.source === 'events' ? 'Events only' : '';
   const task = node.kind === 'fleet'
-    ? `${snapshot.totals.workspaces} ${snapshot.totals.workspaces === 1 ? 'workspace' : 'workspaces'} · ${snapshot.totals.running} running`
+    ? `${num(snapshot.totals.workspaces)} ${snapshot.totals.workspaces === 1 ? 'workspace' : 'workspaces'} · ${num(snapshot.totals.running)} running`
     : node.task || (!group && node.kind !== 'subagent' && node.source === 'events' ? 'No transcript for this agent' : '');
-  const classes = ['card', `st-${node.state}`];
+  const classes = ['card', `st-${tok(node.state)}`];
   if (state.selected === node.id) classes.push('selected');
   if (state.fresh.has(node.id)) classes.push('enter');
   if (state.turned.has(node.id)) classes.push('turned');
@@ -254,7 +333,7 @@ function totalsHtml(snapshot, now) {
   const totals = snapshot.totals;
   const cost = totals.cost === null ? '—' : `${fmtCost(totals.cost)}${totals.costPartial ? '+' : ''}`;
   const elapsed = snapshot.range.start === null ? 0 : (snapshot.live ? now : snapshot.range.end) - snapshot.range.start;
-  return `<span title="Agents finished / agents in range"><b>${totals.settled}/${totals.agents}</b> <span class="opt">agents</span></span>
+  return `<span title="Agents finished / agents in range"><b>${num(totals.settled)}/${num(totals.agents)}</b> <span class="opt">agents</span></span>
     <span title="From the first activity in range to now, or to the last activity when nothing is running"><b>${fmtDuration(Math.max(0, elapsed))}</b></span>
     <span title="Tokens: input, output and cache"><b>${fmtTokens(totals.tokens)}</b> <span class="opt">tok</span></span>
     <span title="Estimated cost from a local price table${totals.costPartial ? '. Incomplete: some models have no price' : ''}"><b>${cost}</b></span>`;
@@ -289,20 +368,20 @@ function traceHtml(snapshot, now) {
     } else {
       for (const item of byNode.get(node.id) ?? []) {
         const to = item.open ? end : item.end;
-        const cls = item.kind === 'state' ? `state-${item.name}` : `${item.kind}${item.error ? ' error' : ''}${item.point ? ' point' : ''}`;
+        const cls = item.kind === 'state' ? `state-${tok(item.name)}` : `${tok(item.kind)}${item.error ? ' error' : ''}${item.point ? ' point' : ''}`;
         const what = item.kind === 'llm' ? prettyModel(item.name) : item.kind === 'state' ? (item.name === 'blocked' ? 'Needs you' : item.name === 'waiting' ? 'Waiting' : 'Working') : item.name;
         const tip = `${what}${item.label ? ` · ${item.label}` : ''}${item.point ? '' : ` · ${fmtDuration(to - item.start)}`}${item.error ? ' · failed' : ''}${item.open ? ' · running' : ''}`;
         bars.push(`<span class="bar ${cls}${item.open ? ' open' : ''}" style="left:${pct(item.start)};width:${item.point ? '2px' : width(item.start, to)}" title="${esc(tip)}"></span>`);
       }
     }
     const mark = node.state === 'running' ? `<span class="pill s-running bare">${ICON.running}</span>` : node.state === 'needs-you' ? `<span class="pill s-needs-you bare">${ICON['needs-you']}</span>` : '';
-    return `<div class="trow k-${node.kind}${state.selected === node.id ? ' selected' : ''}" role="button" tabindex="0" data-id="${esc(node.id)}" title="${esc(node.name)}">
-      <span class="t-name"><span class="indent" style="--d:${node.depth}"></span>${glyph(node)}<span class="label">${esc(node.name)}</span>${mark}</span>
+    return `<div class="trow k-${tok(node.kind)}${state.selected === node.id ? ' selected' : ''}" role="button" tabindex="0" data-id="${esc(node.id)}" title="${esc(node.name)}">
+      <span class="t-name"><span class="indent" style="--d:${num(node.depth)}"></span>${glyph(node)}<span class="label">${esc(node.name)}</span>${mark}</span>
       <span class="lane" style="--tick-w:${(step / span) * 100}%">${bars.join('')}${nowLine}</span>
       <span class="t-dur">${durationHtml(node)}</span>
     </div>`;
   });
-  const dropped = snapshot.spansDropped ? `<span>${snapshot.spansDropped} older calls are not drawn.</span>` : '';
+  const dropped = snapshot.spansDropped ? `<span>${num(snapshot.spansDropped)} older calls are not drawn.</span>` : '';
   return `<div class="trace" style="--zoom:${state.zoom}">
     <div class="thead"><span class="h-name">Agent · call</span><span class="axis">${ticks.join('')}</span><span class="h-dur"></span></div>
     ${rows.join('')}
@@ -317,7 +396,7 @@ function tokensHtml(snapshot) {
   const fleet = snapshot.scope === 'fleet';
   const base = fleet ? 2 : 1;
   const rows = snapshot.nodes.filter((node) => node.id !== 'root').map((node) => {
-    const name = `<div class="cell"><span style="flex:0 0 ${Math.max(0, node.depth - base) * 14}px"></span>${glyph(node)}<span class="label" style="overflow:hidden;text-overflow:ellipsis">${esc(node.name)}</span></div>`;
+    const name = `<div class="cell"><span style="flex:0 0 ${Math.max(0, num(node.depth) - base) * 14}px"></span>${glyph(node)}<span class="label" style="overflow:hidden;text-overflow:ellipsis">${esc(node.name)}</span></div>`;
     if (node.kind === 'workspace') {
       const total = node.total.cost === null ? '' : `${fmtCost(node.total.cost)}${node.total.costPartial ? '+' : ''}`;
       return `<tr class="group"><td>${name}</td><td class="left dim-text" colspan="5">${esc(node.task)}</td><td>${cell(node.total.tokens)}</td><td>${total}</td></tr>`;
@@ -344,7 +423,7 @@ function eventsHtml(snapshot) {
   if (!snapshot.events.length) return '<div class="empty">No events in range.</div>';
   const names = new Map(snapshot.nodes.map((node) => [node.id, node.name]));
   return snapshot.events.map((event) => `<div class="event">
-    <span class="when">${fmtClock(event.ts)}</span><span class="dot ${esc(event.level)}" title="${esc(event.level)}"></span>
+    <span class="when">${fmtClock(event.ts)}</span><span class="dot ${tok(event.level)}" title="${esc(event.level)}"></span>
     <span class="who">${esc(names.get(event.nodeId) ?? '')}</span><span class="what" title="${esc(event.text)}">${esc(event.text)}</span>
   </div>`).join('');
 }
@@ -371,6 +450,26 @@ function wire() {
     if (!target) return;
     event.preventDefault();
     select(target.dataset.id);
+  });
+  for (const [id, view] of [['view-tree', 'tree'], ['view-seq', 'sequence']]) {
+    $(id).addEventListener('click', () => {
+      state.view = view;
+      state.seqJump = view === 'sequence';
+      render(true);
+    });
+  }
+  $('seq-ws').addEventListener('change', (event) => {
+    state.seqWorkspace = event.target.value;
+    state.seqJump = true;
+    render(true);
+  });
+  $('seq-tools').addEventListener('change', (event) => {
+    state.seqTools = event.target.checked;
+    render(true);
+  });
+  $('seq-focus').addEventListener('click', () => {
+    state.selected = null;
+    render(true);
   });
   for (const tab of ['trace', 'tokens', 'events']) {
     $(`tab-${tab}`).addEventListener('click', () => {
@@ -420,6 +519,7 @@ async function boot() {
       const doc = await api.document.get();
       const config = JSON.parse(doc?.content?.text || '{}');
       if (typeof config.workspaceId === 'string' && config.workspaceId) state.workspaceId = config.workspaceId;
+      if (config.view === 'sequence') state.view = 'sequence';
       if (Number.isFinite(config.rangeHours)) state.rangeHours = config.rangeHours;
     } catch {
       // an empty or hand-edited file: use the defaults

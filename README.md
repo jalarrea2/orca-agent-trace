@@ -12,6 +12,24 @@ timeline of model turns and tool calls, a tokens and cost table, and an event lo
 active while one of its agents is running or waiting on you, and for 15 minutes after its last
 agent activity. The first selector switches to the focused workspace or to one workspace by name.
 
+The **Sequence** view (top bar: Tree | Sequence) shows the interaction as a sequence diagram: one
+lane per participant and one row per message, in order.
+
+![The Sequence view: lanes for you and each agent, with arrows for prompts, subagent calls and orchestration messages](assets/sequence-dark.png)
+
+- **You → agent**: prompts. **Agent ⇢ you**: it needs you, or its turn finished, failed or stopped.
+- **Agent → subagent** and back: the call that started it and its return. Subagents that ran at
+  the same time are framed `PAR`.
+- **Agent → agent**: Orca orchestration (`orca orchestration worker-start`, `dispatch`, `send`,
+  `ask`, `reply`, ...), paired through the task, dispatch, message and terminal ids both sides
+  carry, across workspaces. A message whose other side is not in view goes to an **Orca** lane.
+- **Agent → tools** (optional, "Tool calls"): Shell, Files, Web, one lane per MCP server. A run
+  of calls to one lane is one row; a failed call gets its own, and a failed call tried again is
+  framed `RETRY`.
+
+Click a lane to keep only that agent's session. In the all-workspaces scope, tool calls start
+hidden so the agent-to-agent flow stands out, and a selector narrows to one workspace.
+
 It is read-only (it never sends anything to an agent) and local (no network requests).
 
 Motion: running cards breathe and carry a sweeping light, connectors into a running agent flow
@@ -27,8 +45,8 @@ It shows up in two places:
 
 ## Status
 
-Early: version 0.2, built in two days and used on one machine. Not yet listed in Orca's plugin
-directory. Expect rough edges, and please open an issue with what you see.
+Early: version 0.3, used on one machine so far. Expect rough edges, and please open an issue with
+what you see.
 
 ## Install
 
@@ -64,16 +82,30 @@ workspace sit side by side under it.
 | --- | --- | --- |
 | Default time range | Last 6 hours | How far back a one-workspace view looks when it opens (the all-workspaces view opens on the last hour) |
 | Show tool call labels | On | Label calls with the file name, command start or web host; off keeps only the tool name |
-| Claude Code folder | `~/.claude` | Folder that holds `projects/` |
-| Codex folder | `~/.codex` | Folder that holds `sessions/` |
+| Claude Code folder | `~/.claude` | Folder that holds `projects/`. An absolute path, or one starting with `~`; anything else is ignored |
+| Codex folder | `~/.codex` | Folder that holds `sessions/`. Same rule |
 
-## What is stored
+## Security and privacy
 
-Only Orca's own events, in the plugin's private storage (`storage:own`), so the timeline survives
-a worker restart: per terminal pane, its state changes and the name and short label of each tool
-call, for 7 days. No prompt text, tool input or tool output is stored. Transcripts are read in
-place and never copied. Nothing leaves your machine: the view frame has no network access and the
-worker makes no network requests.
+- **Read-only and local.** The worker opens transcript files for reading and nothing else: it
+  writes no files, starts no processes and makes no network requests. The view frame has no
+  network access (Orca denies it). There are no dependencies and no build step: what is in this
+  repository is what runs.
+- **What is stored.** Only Orca's own events, in the plugin's private storage (`storage:own`), so
+  the timeline survives a worker restart: per terminal pane, its title, its state changes and the
+  name and short label of each tool call, for 7 days. No prompt text, tool input or tool output is stored.
+  Transcripts are read in place and never copied.
+- **What is shown.** The start of each prompt, the start of each shell command, file names, web
+  hosts and error messages. Before any of these is shown or stored, common secret shapes are
+  masked as `***`: credentials in URLs, bearer tokens, well-known API key formats, and the values
+  of flags or variables named like a password, token, secret or key. This is best effort, not a
+  guarantee: a secret in an unusual form can still appear, so look before you share a screenshot.
+  Turn **Show tool call labels** off to keep only tool names.
+- **Untrusted text.** Transcripts hold whatever an agent read, including text written to mislead
+  it. Every string is escaped before it reaches the page, names are cut to a fixed length, and a
+  transcript line over 32 MiB is skipped. `tests/security.test.mjs` covers these cases.
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Known limits
 
@@ -101,6 +133,11 @@ worker makes no network requests.
 - **Tool calls of events-only agents are ticks**, not bars: Orca reports when a call finished,
   not when it started. Starting times would need the `agent.tool.before` hook, which makes Claude
   Code wait for the plugin on every call, so it is left out.
+- **A prompt counts as yours unless it carries orchestration ids.** A session started by an Orca
+  automation, or a hand-off without ids, shows as a prompt from You.
+- **Agent pairing relies on the orchestration ids appearing in the transcripts**: in the
+  coordinator's commands and their output, and in the worker's first prompt. It is tested
+  against Orca's documented commands, not yet against a real orchestrated run.
 - **Session titles are the first prompt.** For sessions started by an automation that is often
   boilerplate.
 - **Local machine only.** Workspaces on SSH or paired hosts show state but no transcripts.
@@ -124,7 +161,9 @@ src/core/adapters/*.mjs     transcript lines → normalized session (claude, cod
 src/core/snapshot.mjs       sessions + live panes → what the view draws
 src/core/pricing.mjs        cost from the local price table
 src/node/transcripts.mjs    finds each workspace's transcripts, reads only appended bytes
+src/core/adapters/orch.mjs  orchestration commands and ids in shell calls
 view/                       panel (index.html) and editor tab (editor.html), no framework
+view/sequence.js            the sequence view: lanes, rows and frames from a snapshot
 dev/preview.html            the view in a plain browser, over invented data
 tests/                      node --test
 ```
@@ -141,7 +180,7 @@ tests/                      node --test
 ## Develop
 
 ```sh
-npm test                    # node --test: adapters, pricing, live store, snapshots, worker
+npm test                    # node --test: adapters, pricing, live store, snapshots, worker, security
 npm run preview             # then open http://localhost:8765/dev/preview.html (?theme=dark)
 orca plugin validate .      # manifest and file checks, as Orca runs them
 orca plugin dev watch .     # load as local.agent-trace, reload on save, print logs

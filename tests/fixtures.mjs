@@ -14,10 +14,10 @@ export const claude = {
         usage: usage ?? { input_tokens: 20, output_tokens: 200, cache_read_input_tokens: 8000, cache_creation_input_tokens: 400 },
       },
     }),
-  result: (ts, toolId, { error = false, toolUseResult } = {}, extra = {}) =>
+  result: (ts, toolId, { error = false, toolUseResult, content = 'ok' } = {}, extra = {}) =>
     JSON.stringify({
       type: 'user', timestamp: iso(ts), ...extra, ...(toolUseResult ? { toolUseResult } : {}),
-      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolId, is_error: error, content: 'ok' }] },
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolId, is_error: error, content }] },
     }),
 };
 
@@ -27,7 +27,7 @@ export const codex = {
   user: (ts, text) => JSON.stringify({ timestamp: iso(ts), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } }),
   assistant: (ts, text) => JSON.stringify({ timestamp: iso(ts), type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] } }),
   call: (ts, callId, name, args) => JSON.stringify({ timestamp: iso(ts), type: 'response_item', payload: { type: 'function_call', name, arguments: JSON.stringify(args), call_id: callId } }),
-  output: (ts, callId) => JSON.stringify({ timestamp: iso(ts), type: 'response_item', payload: { type: 'function_call_output', call_id: callId, output: 'ok' } }),
+  output: (ts, callId, output = 'ok') => JSON.stringify({ timestamp: iso(ts), type: 'response_item', payload: { type: 'function_call_output', call_id: callId, output } }),
   tokens: (ts, last, total) => JSON.stringify({ timestamp: iso(ts), type: 'event_msg', payload: { type: 'token_count', info: { last_token_usage: last, total_token_usage: total } } }),
 };
 

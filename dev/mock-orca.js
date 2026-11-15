@@ -27,10 +27,13 @@ export function installMock() {
   const billingLines = [
     codex.meta(t0 - 48_000, 'cx-billing', '/work/billing-api'),
     codex.turn(t0 - 48_000, 'gpt-6-sol'),
-    codex.user(t0 - 47_000, 'Fix the rounding error in invoice totals'),
+    // Started by the checkout coordinator through Orca's orchestration: the prompt carries the ids.
+    codex.user(t0 - 47_000, 'Task task_91be04 · Dispatch ctx_7f3a2c. Fix the rounding error in invoice totals'),
     codex.call(t0 - 41_000, 'b1', 'shell_command', { command: 'rg "toFixed" src/invoices' }),
     codex.output(t0 - 40_200, 'b1'),
     codex.tokens(t0 - 40_000, { input_tokens: 24000, cached_input_tokens: 9000, output_tokens: 700 }, { input_tokens: 24000, cached_input_tokens: 9000, output_tokens: 700 }),
+    codex.call(t0 - 33_000, 'bq', 'shell_command', { command: 'orca orchestration ask --body "Round half-even or half-up?"' }),
+    codex.output(t0 - 26_000, 'bq', 'messageId: msg_4411aa\nanswer: Half-even, as finance asked'),
     codex.call(t0 - 22_000, 'b2', 'apply_patch', { path: '/work/billing-api/src/invoices/total.ts' }),
     codex.output(t0 - 21_500, 'b2'),
     codex.tokens(t0 - 21_000, { input_tokens: 26000, cached_input_tokens: 24000, output_tokens: 2100 }, { input_tokens: 50000, cached_input_tokens: 33000, output_tokens: 2800 }),
@@ -43,9 +46,18 @@ export function installMock() {
     claude.assistant(t0 - 5 * 3_600_000 + 9000, { id: 'o1', text: 'Done.' }, { sessionId: 'sess-old', cwd: '/work/landing-page' }),
   ];
 
+  // The first Claude Code session also coordinates: it starts the billing worker and answers it.
+  const coordinator = { sessionId: 'sess-main', cwd: demo.workspace.path };
+  const coordinatorLines = [
+    claude.assistant(t0 - 52_000, { id: 'k1', tools: [{ id: 'o1', name: 'Bash', input: { command: 'orca orchestration worker-start --spec "Fix the rounding error in invoice totals" --worktree new-top-level --agent codex' } }] }, coordinator),
+    claude.result(t0 - 49_500, 'o1', { content: 'worker started\ntask: task_91be04\ndispatch: ctx_7f3a2c' }, coordinator),
+    claude.user(t0 - 31_000, '[Orca] Question from dispatch ctx_7f3a2c (msg_4411aa): Round half-even or half-up?', coordinator),
+    claude.assistant(t0 - 28_000, { id: 'k2', tools: [{ id: 'o2', name: 'Bash', input: { command: 'orca orchestration reply --id msg_4411aa --body "Half-even, as finance asked"' } }] }, coordinator),
+    claude.result(t0 - 27_400, 'o2', {}, coordinator),
+  ];
   const sessionsOf = {
     [demo.workspace.id]: () => [
-      ...demo.claudeSessions.map((session) => parse(createClaudeParser, [...session.lines, ...Object.values(session.subagents).flat()])),
+      ...demo.claudeSessions.map((session, index) => parse(createClaudeParser, [...session.lines, ...(index === 0 ? coordinatorLines : []), ...Object.values(session.subagents).flat()])),
       ...demo.codexSessions.map((session) => parse(createCodexParser, session.lines)),
     ],
     [billing.id]: () => [parse(createCodexParser, billingLines)],

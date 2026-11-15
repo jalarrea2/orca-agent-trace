@@ -18,12 +18,13 @@ const RECENT_MS = 120_000;
 const MATCH_SLACK_MS = 180_000;
 export const MAX_SPANS = 5000;
 export const MAX_EVENTS = 200;
+export const MAX_MESSAGES = 800;
 // In the fleet view a workspace stays listed this long after its last agent activity.
 export const ACTIVE_WINDOW_MS = 15 * 60_000;
 
 export function agentLabel(kind) {
-  if (!kind) return 'Agent';
-  return AGENT_LABELS[kind] ?? kind.charAt(0).toUpperCase() + kind.slice(1);
+  if (typeof kind !== 'string' || !kind) return 'Agent';
+  return Object.hasOwn(AGENT_LABELS, kind) ? AGENT_LABELS[kind] : kind.charAt(0).toUpperCase() + kind.slice(1);
 }
 
 // workspace: { id, name, branch } | null
@@ -31,7 +32,7 @@ export function agentLabel(kind) {
 // panes:     live panes of this workspace (see live.mjs)
 export function buildSnapshot({ workspace = null, sessions = [], panes = [], now = Date.now(), since = 0, notices = [], pricesAsOf = '' } = {}) {
   const part = collectWorkspace({ workspace, sessions, panes, now, since, id: 'root', parentId: null, depth: 0 });
-  return finish({ scope: 'workspace', nodes: part.nodes, spans: part.spans, events: part.events, workspace, workspaces: 1, now, since, notices, pricesAsOf });
+  return finish({ scope: 'workspace', nodes: part.nodes, spans: part.spans, events: part.events, flows: [part.flows], workspace, workspaces: 1, now, since, notices, pricesAsOf });
 }
 
 // groups: [{ workspace: { id, name, branch }, sessions, panes, busy? }] for every workspace Orca
@@ -59,12 +60,14 @@ export function buildFleetSnapshot({ groups = [], now = Date.now(), since = 0, a
   const nodes = [root];
   const spans = [];
   const events = [];
+  const flows = [];
   for (const { part } of parts) {
     nodes.push(...part.nodes);
     spans.push(...part.spans);
     events.push(...part.events);
+    flows.push(part.flows);
   }
-  return finish({ scope: 'fleet', nodes, spans, events, workspace: null, workspaces: parts.length, now, since, notices, pricesAsOf });
+  return finish({ scope: 'fleet', nodes, spans, events, flows, workspace: null, workspaces: parts.length, now, since, notices, pricesAsOf });
 }
 
 // One workspace as a node followed by its agents and subagents, in tree order.
@@ -72,6 +75,9 @@ function collectWorkspace({ workspace, sessions = [], panes = [], now, since, id
   const nodes = [];
   const spans = [];
   const events = [];
+  // What the sequence view needs to pair agents: prompts, orchestration commands, and which node
+  // answers to which orchestration id or terminal handle.
+  const flows = { prompts: [], orch: [], inbound: [], terminals: [] };
 
   const live = sessions.filter((session) => (mainOf(session)?.lastAt ?? 0) >= since && mainOf(session)?.firstAt !== null);
   live.sort((a, b) => mainOf(a).firstAt - mainOf(b).firstAt);
@@ -119,7 +125,7 @@ function collectWorkspace({ workspace, sessions = [], panes = [], now, since, id
       nodes.push(item);
       const openEnd = ACTIVE.has(state) ? now : agent.lastAt ?? now;
       for (const span of agent.spans) {
-        spans.push({ nodeId: item.id, kind: span.kind, name: span.name, label: span.label || '', start: span.start, end: span.end ?? openEnd, error: span.error === true, open: span.end === null && ACTIVE.has(state) });
+        spans.push({ nodeId: item.id, kind: span.kind, name: span.name, label: span.label || '', start: span.start, end: span.end ?? openEnd, error: span.error === true, open: span.end === null && ACTIVE.has(state), ...(span.orch ? { orch: true } : {}) });
       }
       if (isMain && pane) {
         // Only the stretches a person may care about: the agent waiting on them.
@@ -130,6 +136,10 @@ function collectWorkspace({ workspace, sessions = [], panes = [], now, since, id
       }
     }
     for (const event of session.events) events.push({ ts: event.ts, nodeId: idOf(event.agentKey ?? ''), level: event.level, text: event.text });
+    flows.inbound.push({ nodeId: idOf(''), ids: session.inboundIds ?? [] });
+    if (pane?.terminalId) flows.terminals.push({ id: pane.terminalId, nodeId: idOf('') });
+    for (const prompt of session.prompts ?? []) flows.prompts.push({ ts: prompt.ts, to: idOf(prompt.agentKey ?? ''), text: prompt.text, ids: prompt.ids ?? [] });
+    for (const command of session.orch ?? []) flows.orch.push({ ts: command.ts, from: idOf(command.agentKey ?? ''), verb: command.verb, subject: command.subject, ids: command.ids ?? [], error: command.error === true });
   }
 
   // Panes with no transcript behind them: an agent with no adapter, or a session not found on disk.
@@ -147,6 +157,7 @@ function collectWorkspace({ workspace, sessions = [], panes = [], now, since, id
     list.forEach((span, index) => spans.push({ nodeId: item.id, ...span, label: '', error: false, open: working && index === list.length - 1 && span.name === 'working' }));
     for (const tool of pane.tools) spans.push({ nodeId: item.id, kind: 'tool', name: tool.tool, label: tool.label || '', start: tool.at, end: tool.at, error: false, open: false, point: true });
     paneEvents(pane, item.id, events);
+    if (pane.terminalId) flows.terminals.push({ id: pane.terminalId, nodeId: item.id });
   }
 
   const agents = nodes.slice(1);
@@ -154,10 +165,10 @@ function collectWorkspace({ workspace, sessions = [], panes = [], now, since, id
   top.startedAt = minOf(agents.map((item) => item.startedAt));
   top.endedAt = ACTIVE.has(top.state) ? null : maxOf(agents.map((item) => item.endedAt));
   top.lastAt = maxOf(agents.map((item) => item.lastAt)) ?? 0;
-  return { nodes, spans, events };
+  return { nodes, spans, events, flows };
 }
 
-function finish({ scope, nodes, spans, events, workspace, workspaces, now, since, notices, pricesAsOf }) {
+function finish({ scope, nodes, spans, events, flows = [], workspace, workspaces, now, since, notices, pricesAsOf }) {
   rollUp(nodes);
   const root = nodes[0];
   const agents = nodes.filter((item) => item.kind === 'agent' || item.kind === 'subagent');
@@ -195,9 +206,87 @@ function finish({ scope, nodes, spans, events, workspace, workspaces, now, since
     spans: clipped.spans,
     spansDropped: clipped.dropped,
     events: events.filter((event) => event.ts >= since).slice(0, MAX_EVENTS),
+    messages: resolveMessages(flows, new Set(nodes.map((item) => item.id)), since),
     notices,
     pricesAsOf,
   };
+}
+
+// Who talked to whom: every prompt and orchestration command as { ts, from, to, kind, verb,
+// label, error }, where from/to is a node id, 'you' (typed by the person, as far as the
+// transcript shows) or 'orca' (an orchestration id no agent in range answers to).
+// Agents are paired by orchestration ids: a dispatched worker's first prompt carries its task
+// and dispatch ids, a terminal handle names its pane, and an id a worker's command produced
+// (the message id of a question, say) names that worker to whoever uses it next.
+function resolveMessages(flows, known, since) {
+  const rootOf = (id) => (id.startsWith('s:') ? id.split(':').slice(0, 2).join(':') : id);
+  const owner = new Map(); // id → the node it addresses
+  const inbound = new Map(); // node → Set of the ids it was dispatched with
+  const prompts = [];
+  const orch = [];
+  for (const flow of flows) {
+    for (const { nodeId, ids } of flow.inbound) {
+      inbound.set(nodeId, new Set(ids));
+      for (const id of ids) if (!owner.has(id)) owner.set(id, nodeId);
+    }
+    for (const { id, nodeId } of flow.terminals) owner.set(id, nodeId);
+    prompts.push(...flow.prompts);
+    orch.push(...flow.orch);
+  }
+  orch.sort((a, b) => a.ts - b.ts);
+  prompts.sort((a, b) => a.ts - b.ts);
+
+  // The coordinator of a worker: the first other agent to run a command with one of its ids.
+  const usedBy = new Map(); // id → roots that ran a command naming it, in time order
+  for (const command of orch) {
+    const root = rootOf(command.from);
+    for (const id of command.ids) {
+      if (!usedBy.has(id)) usedBy.set(id, []);
+      if (!usedBy.get(id).includes(root)) usedBy.get(id).push(root);
+    }
+  }
+  const coordinatorOf = (root) => {
+    for (const id of inbound.get(root) ?? []) {
+      const other = (usedBy.get(id) ?? []).find((candidate) => candidate !== root);
+      if (other) return other;
+    }
+    return null;
+  };
+
+  const out = [];
+  const claimed = new Map(); // an id nobody was dispatched with → the agent whose command first carried it
+  for (const command of orch) {
+    const root = rootOf(command.from);
+    let to = null;
+    for (const id of command.ids) {
+      const target = owner.get(id) ?? claimed.get(id);
+      if (target && rootOf(target) !== root) {
+        to = target;
+        break;
+      }
+    }
+    to ??= coordinatorOf(root) ?? 'orca';
+    for (const id of command.ids) if (!owner.has(id) && !claimed.has(id)) claimed.set(id, root);
+    out.push({ ts: command.ts, from: command.from, to, kind: 'orch', verb: command.verb, label: command.subject ? `${command.verb}: ${command.subject}` : command.verb, error: command.error });
+  }
+  for (const prompt of prompts) {
+    const root = rootOf(prompt.to);
+    let from = 'you';
+    if (prompt.ids.length) {
+      // A worker reporting back names itself; a coordinator dispatching names its worker.
+      const reporter = prompt.ids.map((id) => owner.get(id) ?? claimed.get(id)).find((target) => target && rootOf(target) !== root);
+      const dispatcher = prompt.ids.flatMap((id) => usedBy.get(id) ?? []).find((candidate) => candidate !== root);
+      from = reporter ?? dispatcher ?? 'orca';
+    }
+    // The command that sent it is already drawn: do not draw the delivery as a second message.
+    const sent = from !== 'you' && from !== 'orca' && out.some((message) => message.kind === 'orch' && rootOf(message.from) === rootOf(from) && rootOf(message.to) === root && prompt.ts - message.ts >= 0 && prompt.ts - message.ts < 120_000);
+    if (sent) continue;
+    out.push({ ts: prompt.ts, from, to: prompt.to, kind: 'prompt', verb: '', label: prompt.text, error: false });
+  }
+  return out
+    .filter((message) => message.ts >= since && (known.has(message.from) || message.from === 'you' || message.from === 'orca') && (known.has(message.to) || message.to === 'orca'))
+    .sort((a, b) => a.ts - b.ts)
+    .slice(-MAX_MESSAGES);
 }
 
 function node(fields) {
