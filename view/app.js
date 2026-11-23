@@ -11,12 +11,20 @@ import { buildSequence, GUTTER_W, LANE_W, sequenceHtml } from './sequence.js';
 
 const POLL_MS = 3000;
 const TICK_MS = 1000;
+// The timeline and the sequence diagram depend on "now", so while agents run their HTML changes
+// on every tick. With a busy fleet that is thousands of bars rebuilt each second, which blocked
+// the panel long enough for Orca to suspend it. The clock tick redraws them at most this often.
+const HEAVY_TICK_MS = 5000;
+// `trace.changed` arrives every few hundred ms while transcripts are being written; reloads are
+// spaced at least this far apart.
+const MIN_LOAD_GAP_MS = 2000;
 const NARROW_PX = 640;
 const TINY_PX = 340;
 // A redraw waits while the pointer is over the region, so a tooltip or a click is not lost, but
 // never longer than this.
 const HOVER_HOLD_MS = 4000;
 const ZOOMS = [1, 2, 4, 8, 16];
+const STATS_MS = 60_000;
 const FLEET = 'all';
 const FOCUSED = 'focused';
 const STATE_LABEL = {
@@ -36,13 +44,14 @@ const ICON = {
 const $ = (id) => document.getElementById(id);
 const api = window.orca;
 const state = {
-  workspaceId: FLEET, rangeHours: null, tab: 'trace', selected: null, zoom: 1,
+  workspaceId: FLEET, project: '', rangeHours: null, tab: 'trace', selected: null, zoom: 1,
   view: 'tree', // 'tree' | 'sequence': what the upper region draws
   seqWorkspace: 'all', // in the all-workspaces scope, the workspace node the sequence shows
   seqTools: null, // whether the sequence has tool rows; null follows the scope's default
   seqJump: false, // scroll the sequence to its newest row on the next draw
   prevAt: null, // when the previous snapshot was taken: rows after it animate in
   data: null, receivedAt: 0, error: null, loading: false, queued: false,
+  stats: null, statsFor: null, statsAt: 0, statsLoading: false, // delivery statistics, loaded with their tab
   known: null, // node id → state at the previous snapshot; null before the first one
   fresh: new Set(), // nodes that first appeared in the current snapshot
   turned: new Set(), // nodes whose state changed in the current snapshot
@@ -78,9 +87,11 @@ async function load() {
     return;
   }
   state.loading = true;
+  state.loadedAt = performance.now();
   try {
     const input = { workspaceId: state.workspaceId };
     if (state.rangeHours) input.rangeHours = state.rangeHours;
+    if (state.project) input.project = state.project;
     const data = await api.plugin.request('trace.snapshot', input, { timeoutMs: 30000 });
     const next = new Map(data.snapshot.nodes.map((node) => [node.id, node.state]));
     state.fresh = new Set();
@@ -133,7 +144,13 @@ function setHtml(element, html, force, follow = false) {
   element.scrollTop = follow && atEnd ? element.scrollHeight : scrollTop;
 }
 
-function render(force = false) {
+let heavyAt = 0;
+
+// `tick` is the one-second clock: it refreshes counters every time and the timeline/sequence
+// regions only every HEAVY_TICK_MS.
+function render(force = false, tick = false) {
+  const heavy = !tick || performance.now() - heavyAt >= HEAVY_TICK_MS;
+  if (heavy) heavyAt = performance.now();
   const width = document.documentElement.clientWidth;
   document.body.classList.toggle('narrow', width < NARROW_PX);
   document.body.classList.toggle('tiny', width < TINY_PX);
@@ -147,19 +164,20 @@ function render(force = false) {
   const now = liveNow();
   const sequence = state.view === 'sequence';
   document.body.classList.toggle('seq-view', sequence);
-  setHtml($('graph'), sequence ? seqHtml(snapshot, now, width) : graphHtml(snapshot), force, sequence);
+  if (heavy || !sequence) setHtml($('graph'), sequence ? seqHtml(snapshot, now, width) : graphHtml(snapshot), force, sequence);
   if (sequence && state.seqJump) {
     state.seqJump = false;
     $('graph').scrollTop = $('graph').scrollHeight;
   }
   $('attn').textContent = snapshot.totals.attention ? String(snapshot.totals.attention) : '';
   $('totals').innerHTML = totalsHtml(snapshot, now);
-  for (const tab of ['trace', 'tokens', 'events']) {
+  for (const tab of TABS) {
     $(`tab-${tab}`).setAttribute('aria-selected', String(state.tab === tab));
     $(`panel-${tab}`).hidden = state.tab !== tab;
   }
   const panel = $(`panel-${state.tab}`);
-  setHtml(panel, state.tab === 'trace' ? traceHtml(snapshot, now) : state.tab === 'tokens' ? tokensHtml(snapshot) : eventsHtml(snapshot), force);
+  if (heavy || state.tab !== 'trace') setHtml(panel, state.tab === 'trace' ? traceHtml(snapshot, now) : state.tab === 'tokens' ? tokensHtml(snapshot) : state.tab === 'delivery' ? deliveryHtml() : eventsHtml(snapshot), force);
+  if (state.tab === 'delivery' && (state.statsFor !== state.project || performance.now() - state.statsAt > STATS_MS)) void loadStats();
   $('zoom').hidden = state.tab !== 'trace';
   fillLive(now);
 }
@@ -174,10 +192,20 @@ function fillLive(now) {
 }
 
 function renderBar(data) {
+  const projects = data?.projects ?? [];
+  const projectPick = $('project');
+  const projectHtml = `<option value="">All projects</option>${projects.map((item) => `<option value="${esc(item.name)}">${esc(item.name)} (${num(item.count)})</option>`).join('')}`;
+  if (projectPick.dataset.html !== projectHtml) {
+    projectPick.innerHTML = projectHtml;
+    projectPick.dataset.html = projectHtml;
+  }
+  if (data) state.project = data.project ?? '';
+  projectPick.value = state.project;
+  projectPick.hidden = projects.length < 2;
   const select = $('ws');
   const rows = data?.workspaces ?? [];
   const options = rows.map((row) => `<option value="${esc(row.id)}">${esc(row.name)}${row.focused ? ' (focused)' : ''}</option>`);
-  const html = `<option value="${FLEET}">All active workspaces</option><option value="${FOCUSED}">Focused workspace</option>${options.join('')}`;
+  const html = `<option value="${FLEET}">${state.project ? `All active in ${esc(state.project)}` : 'All active workspaces'}</option><option value="${FOCUSED}">Focused workspace</option>${options.join('')}`;
   if (select.dataset.html !== html) {
     select.innerHTML = html;
     select.dataset.html = html;
@@ -289,6 +317,7 @@ function cardHtml(node, snapshot) {
     <button class="${classes.join(' ')}" data-id="${esc(node.id)}" title="${esc(node.name)}${node.task ? ` — ${esc(node.task)}` : ''}${tokens ? `\n${tokens}` : ''}">
       <div class="row1">${glyph(node)}<span class="name">${esc(node.name)}</span>${pill(node.state)}</div>
       <div class="task">${esc(task)}</div>
+      ${group && progressOf(snapshot).get(node.id) ? progressBar(progressOf(snapshot).get(node.id)) : ''}
       <div class="meta"><span class="model">${esc(left)}</span>${cost}<span class="time">${durationHtml(node, cost ? '· ' : '')}</span></div>
     </button>
   </div>`;
@@ -327,13 +356,55 @@ function graphHtml(snapshot) {
   </div>`;
 }
 
+// ---- Progress ----------------------------------------------------------------------------
+
+const PROGRESS_PARTS = [
+  ['done', 'done'], ['failed', 'failed'], ['stopped', 'stopped'], ['running', 'running'], ['needs-you', 'needs you'], ['waiting', 'waiting'], ['unknown', 'unknown'],
+];
+const progressCache = new WeakMap();
+
+// Agent states per group node (the fleet root and each workspace), from the tree order of the
+// snapshot: a workspace node is followed by its agents and subagents.
+function progressOf(snapshot) {
+  if (progressCache.has(snapshot)) return progressCache.get(snapshot);
+  const out = new Map();
+  const bump = (id, nodeState) => {
+    if (!out.has(id)) out.set(id, { total: 0 });
+    const counts = out.get(id);
+    counts.total += 1;
+    counts[nodeState] = (counts[nodeState] ?? 0) + 1;
+  };
+  let workspace = null;
+  const root = snapshot.nodes[0];
+  for (const node of snapshot.nodes) {
+    if (node.kind === 'workspace') workspace = node.id;
+    if (node.kind !== 'agent' && node.kind !== 'subagent') continue;
+    const nodeState = STATE_LABEL[node.state] ? node.state : 'unknown';
+    if (workspace) bump(workspace, nodeState);
+    if (root && root.id !== workspace) bump(root.id, nodeState);
+  }
+  progressCache.set(snapshot, out);
+  return out;
+}
+
+// A stacked bar: settled work (done, failed, stopped) first, then what is still moving.
+function progressBar(counts, size = '') {
+  if (!counts?.total) return '';
+  const settled = (counts.done ?? 0) + (counts.failed ?? 0) + (counts.stopped ?? 0);
+  const pct = Math.round((settled / counts.total) * 100);
+  const segments = PROGRESS_PARTS.filter(([key]) => counts[key]).map(([key]) => `<i class="p-${key}" style="flex-grow:${counts[key]}"></i>`).join('');
+  const tip = `${pct}% settled · ${PROGRESS_PARTS.filter(([key]) => counts[key]).map(([key, label]) => `${counts[key]} ${label}`).join(' · ')}`;
+  return `<span class="progress ${size}" role="progressbar" aria-valuemin="0" aria-valuemax="${counts.total}" aria-valuenow="${settled}" title="${esc(tip)}">${segments}</span>`;
+}
+
 // ---- Totals ------------------------------------------------------------------------------
 
 function totalsHtml(snapshot, now) {
   const totals = snapshot.totals;
   const cost = totals.cost === null ? '—' : `${fmtCost(totals.cost)}${totals.costPartial ? '+' : ''}`;
   const elapsed = snapshot.range.start === null ? 0 : (snapshot.live ? now : snapshot.range.end) - snapshot.range.start;
-  return `<span title="Agents finished / agents in range"><b>${num(totals.settled)}/${num(totals.agents)}</b> <span class="opt">agents</span></span>
+  const overall = progressOf(snapshot).get(snapshot.nodes[0]?.id);
+  return `<span class="totals-progress" title="Agents finished / agents in range">${overall ? progressBar(overall, 'wide') : ''}<b>${num(totals.settled)}/${num(totals.agents)}</b> <span class="opt">agents</span></span>
     <span title="From the first activity in range to now, or to the last activity when nothing is running"><b>${fmtDuration(Math.max(0, elapsed))}</b></span>
     <span title="Tokens: input, output and cache"><b>${fmtTokens(totals.tokens)}</b> <span class="opt">tok</span></span>
     <span title="Estimated cost from a local price table${totals.costPartial ? '. Incomplete: some models have no price' : ''}"><b>${cost}</b></span>`;
@@ -389,6 +460,92 @@ function traceHtml(snapshot, now) {
   </div>`;
 }
 
+// ---- Delivery ----------------------------------------------------------------------------
+
+const TABS = ['trace', 'tokens', 'events', 'delivery'];
+
+async function loadStats() {
+  if (state.statsLoading) return;
+  state.statsLoading = true;
+  state.statsAt = performance.now();
+  const project = state.project;
+  try {
+    const answer = await api.plugin.request('trace.stats', { project }, { timeoutMs: 30000 });
+    state.stats = { ...answer, project };
+  } catch (error) {
+    state.stats = { stats: null, notice: `Could not load delivery statistics (${error?.code ?? 'error'}: ${error?.message ?? error}).`, project };
+  } finally {
+    state.statsFor = project;
+    state.statsLoading = false;
+  }
+  render(true);
+}
+
+const pctText = (value) => (value === null || value === undefined ? '—' : `${Math.round(value * 100)}%`);
+const durText = (ms) => (ms === null || ms === undefined ? '—' : fmtDuration(ms));
+const rateText = (perDay) => (perDay >= 1 ? `${perDay.toFixed(perDay >= 10 ? 0 : 1)}/day` : perDay > 0 ? `${(perDay * 7).toFixed(1)}/week` : '0');
+
+// DORA performance bands (State of DevOps): elite, high, medium, low.
+function band(metric, value) {
+  if (value === null || value === undefined) return '';
+  const levels = {
+    deploys: value >= 1 ? 'elite' : value >= 1 / 7 ? 'high' : value >= 1 / 30 ? 'medium' : 'low',
+    lead: value <= 86_400_000 ? 'elite' : value <= 7 * 86_400_000 ? 'high' : value <= 30 * 86_400_000 ? 'medium' : 'low',
+    cfr: value <= 0.05 ? 'elite' : value <= 0.1 ? 'high' : value <= 0.15 ? 'medium' : 'low',
+    restore: value <= 3_600_000 ? 'elite' : value <= 86_400_000 ? 'high' : value <= 7 * 86_400_000 ? 'medium' : 'low',
+  };
+  return `<span class="band b-${levels[metric]}">${levels[metric]}</span>`;
+}
+
+function doraTiles(dora) {
+  const tile = (label, value, extra, tip) => `<div class="tile" title="${esc(tip)}"><div class="t-label">${label}</div><div class="t-value">${value}</div><div class="t-extra">${extra}</div></div>`;
+  return `<div class="tiles">
+    ${tile('Deployment frequency', rateText(dora.deploysPerDay), `${num(dora.deploys)} deploys ${band('deploys', dora.deploysPerDay)}`, 'Successful runs of the deploy workflow on the production branch')}
+    ${tile('Lead time for changes', durText(dora.leadTimeMs), band('lead', dora.leadTimeMs), 'Median time from pull request opened to merged, for PRs merged in the window')}
+    ${tile('Change failure rate', pctText(dora.changeFailureRate), `${num(dora.failedDeploys)} failed ${band('cfr', dora.changeFailureRate)}`, 'Failed deploy runs / finished deploy runs')}
+    ${tile('Time to restore', durText(dora.timeToRestoreMs), `${dora.unrestored ? `${num(dora.unrestored)} not restored ` : ''}${band('restore', dora.timeToRestoreMs)}`, 'Median time from a failed deploy run to the next successful one')}
+  </div>`;
+}
+
+function deliveryHtml() {
+  const answer = state.stats;
+  if (!answer || state.statsFor !== state.project) return '<div class="empty">Loading delivery statistics…</div>';
+  if (!answer.stats) return `<div class="empty">${esc(answer.notice ?? 'No delivery statistics.')}</div>`;
+  const stats = answer.stats;
+  const day = stats.total['24h'];
+  const week = stats.total['7d'];
+  const prRow = (label, key) => `<tr><td class="left">${label}</td><td>${num(day.prs[key])}</td><td>${num(week.prs[key])}</td></tr>`;
+  const authors = (day.authors.length ? day.authors : week.authors).slice(0, 12);
+  const authorRows = authors.map((row) => {
+    const weekRow = week.authors.find((item) => item.login === row.login) ?? row;
+    const dayRow = day.authors.find((item) => item.login === row.login) ?? { opened: 0, merged: 0 };
+    return `<tr><td class="left">${esc(row.login)}${row.bot ? ' <span class="dim-text">bot</span>' : ''}</td><td>${num(dayRow.opened)} / ${num(dayRow.merged)}</td><td>${num(weekRow.opened)} / ${num(weekRow.merged)}</td><td><span class="add">+${num(weekRow.additions)}</span> <span class="del">−${num(weekRow.deletions)}</span></td></tr>`;
+  }).join('');
+  const projects = stats.projects.length > 1 ? `<table class="stats"><thead><tr><th class="left">Project</th><th>PRs merged 24 h</th><th>PRs merged 7 d</th><th>Deploys 7 d</th><th>Lead time 7 d</th><th>CFR 7 d</th></tr></thead><tbody>${stats.projects.map((row) => {
+    const w = row.windows['7d'];
+    return `<tr><td class="left" title="${esc(row.repo)}${row.deploySource ? ` · deploys: ${esc(row.deploySource)}` : ''}">${esc(row.project)}</td><td>${num(row.windows['24h'].prs.merged)}</td><td>${num(w.prs.merged)}</td><td>${num(w.dora.deploys)}</td><td>${durText(w.dora.leadTimeMs)}</td><td>${pctText(w.dora.changeFailureRate)}</td></tr>`;
+  }).join('')}</tbody></table>` : '';
+  const errors = Object.entries(stats.errors ?? {}).map(([name, message]) => `<div class="notice">${esc(name)}: ${esc(message)}</div>`).join('');
+  const sources = stats.projects.map((row) => `${esc(row.project)}: ${row.deploySource ? esc(row.deploySource) : 'no deploy workflow found'}`).join(' · ');
+  return `<div class="delivery">
+    ${errors}
+    <h3>Last 24 hours ${state.project ? `· ${esc(state.project)}` : '· all projects'}</h3>
+    ${doraTiles(day.dora)}
+    <h3>Last 7 days</h3>
+    ${doraTiles(week.dora)}
+    <div class="stats-grid">
+      <table class="stats"><thead><tr><th class="left">Pull requests</th><th>24 h</th><th>7 d</th></tr></thead><tbody>
+        ${prRow('Opened', 'opened')}${prRow('Merged', 'merged')}${prRow('Closed without merge', 'closed')}
+        <tr><td class="left">Open now</td><td colspan="2">${num(day.prs.open)}</td></tr>
+        <tr><td class="left">Lines merged</td><td><span class="add">+${num(day.prs.additions)}</span> <span class="del">−${num(day.prs.deletions)}</span></td><td><span class="add">+${num(week.prs.additions)}</span> <span class="del">−${num(week.prs.deletions)}</span></td></tr>
+      </tbody></table>
+      <table class="stats"><thead><tr><th class="left">Contributor</th><th>24 h opened / merged</th><th>7 d opened / merged</th><th>7 d lines</th></tr></thead><tbody>${authorRows || '<tr><td class="left dim-text" colspan="4">No pull requests in the window.</td></tr>'}</tbody></table>
+    </div>
+    ${projects}
+    <div class="legend">From GitHub through the ${esc(answer.hub ?? 'hub')} hub's <code>gh</code> sign-in, refreshed every 5 minutes (fetched ${fmtClock(stats.fetchedAt)}). DORA metrics are proxies: lead time is PR opened → merged; deploys are ${sources}. Bands follow the DORA report (elite/high/medium/low).</div>
+  </div>`;
+}
+
 // ---- Tokens & cost -----------------------------------------------------------------------
 
 function tokensHtml(snapshot) {
@@ -404,7 +561,8 @@ function tokensHtml(snapshot) {
     const tokens = node.tokens;
     if (!tokens) return `<tr><td>${name}</td><td class="left dim-text" colspan="7">Events only: Orca reports this agent's status and tool calls, not its tokens.</td></tr>`;
     const cost = node.cost === null ? '<span class="dim-text" title="No price for this model in the local table">no price</span>' : `${fmtCost(node.cost)}${node.costPartial ? '+' : ''}`;
-    return `<tr><td>${name}</td><td class="left">${esc(prettyModel(node.model) || '—')}</td><td>${cell(tokens.input)}</td><td>${cell(tokens.output)}</td><td>${cell(tokens.cacheRead)}</td><td>${cell(tokens.cacheWrite)}</td><td>${cell(tokens.total)}</td><td>${cost}</td></tr>`;
+    const reported = typeof node.reportedCost === 'number' ? `<div class="dim-text" title="Reported by the agent over OpenTelemetry, for the whole session including subagents">${fmtCost(node.reportedCost)} reported</div>` : '';
+    return `<tr><td>${name}</td><td class="left">${esc(prettyModel(node.model) || '—')}</td><td>${cell(tokens.input)}</td><td>${cell(tokens.output)}</td><td>${cell(tokens.cacheRead)}</td><td>${cell(tokens.cacheWrite)}</td><td>${cell(tokens.total)}</td><td>${cost}${reported}</td></tr>`;
   });
   if (!rows.length) return '<div class="empty">No agents in range.</div>';
   const totals = snapshot.totals;
@@ -414,7 +572,7 @@ function tokensHtml(snapshot) {
     <tbody>${rows.join('')}</tbody>
     <tfoot><tr><td>Total</td><td></td><td>${fmtTokens(sum('input'))}</td><td>${fmtTokens(sum('output'))}</td><td>${fmtTokens(sum('cacheRead'))}</td><td>${fmtTokens(sum('cacheWrite'))}</td><td>${fmtTokens(totals.tokens)}</td><td>${totals.cost === null ? '—' : `${fmtCost(totals.cost)}${totals.costPartial ? '+' : ''}`}</td></tr></tfoot>
   </table>
-  <div class="foot">Each agent row is that agent's own usage${fleet ? '; a workspace row is the sum of its agents' : ''}. Cost is an estimate from a local price table${snapshot.pricesAsOf ? ` (prices as of ${esc(snapshot.pricesAsOf)})` : ''}, not a bill; a “+” means some usage had no price.</div>`;
+  <div class="foot">Each agent row is that agent's own usage${fleet ? '; a workspace row is the sum of its agents' : ''}. Cost is an estimate from a local price table${snapshot.pricesAsOf ? ` (prices as of ${esc(snapshot.pricesAsOf)})` : ''}, not a bill; a “+” means some usage had no price. “Reported” is the cost the agent itself sent over OpenTelemetry to an Agent Trace hub (remote hosts).</div>`;
 }
 
 // ---- Events ------------------------------------------------------------------------------
@@ -471,12 +629,19 @@ function wire() {
     state.selected = null;
     render(true);
   });
-  for (const tab of ['trace', 'tokens', 'events']) {
+  for (const tab of TABS) {
     $(`tab-${tab}`).addEventListener('click', () => {
       state.tab = tab;
       render(true);
     });
   }
+  $('project').addEventListener('change', (event) => {
+    state.project = event.target.value;
+    state.workspaceId = FLEET;
+    state.selected = null;
+    state.known = null;
+    void load();
+  });
   $('ws').addEventListener('change', (event) => {
     state.workspaceId = event.target.value || FLEET;
     state.selected = null;
@@ -497,18 +662,20 @@ function wire() {
     render(true);
   });
   // A redraw held back while the pointer was over a region happens as soon as it leaves.
-  for (const id of ['graph', 'panel-trace', 'panel-tokens', 'panel-events']) $(id).addEventListener('mouseleave', () => render());
+  for (const id of ['graph', 'panel-trace', 'panel-tokens', 'panel-events', 'panel-delivery']) $(id).addEventListener('mouseleave', () => render());
   window.addEventListener('resize', () => render(true));
   setInterval(() => {
     if (!document.hidden) void load();
   }, POLL_MS);
   setInterval(() => {
-    if (!document.hidden && state.data?.snapshot.live) render();
+    if (!document.hidden && state.data?.snapshot.live) render(false, true);
   }, TICK_MS);
   let timer = null;
   api.plugin.on('trace.changed', () => {
+    if (document.hidden) return; // the poll catches up when the panel is shown again
     clearTimeout(timer);
-    timer = setTimeout(() => void load(), 250);
+    const gap = MIN_LOAD_GAP_MS - (performance.now() - (state.loadedAt ?? 0));
+    timer = setTimeout(() => void load(), Math.max(250, gap));
   });
 }
 
@@ -519,6 +686,7 @@ async function boot() {
       const doc = await api.document.get();
       const config = JSON.parse(doc?.content?.text || '{}');
       if (typeof config.workspaceId === 'string' && config.workspaceId) state.workspaceId = config.workspaceId;
+      if (typeof config.project === 'string') state.project = config.project;
       if (config.view === 'sequence') state.view = 'sequence';
       if (Number.isFinite(config.rangeHours)) state.rangeHours = config.rangeHours;
     } catch {

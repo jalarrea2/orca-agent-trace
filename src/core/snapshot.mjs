@@ -121,6 +121,9 @@ function collectWorkspace({ workspace, sessions = [], panes = [], now, since, id
         requests: agent.requests,
         toolCount: agent.toolCount,
         errorCount: agent.errorCount,
+        // What the agent itself reported over OpenTelemetry (an Agent Trace hub), for the whole
+        // session including its subagents. Null when no hub saw the session or it had no price.
+        reportedCost: isMain && session.otel?.priced ? session.otel.costUsd : null,
       });
       nodes.push(item);
       const openEnd = ACTIVE.has(state) ? now : agent.lastAt ?? now;
