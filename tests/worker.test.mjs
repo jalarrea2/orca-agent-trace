@@ -167,3 +167,30 @@ test('worker: without workspace.list it still shows what the events say, and say
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test('worker: filters the fleet by project and lists the projects', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agent-trace-'));
+  const NOW = Date.now();
+  const demo = demoScenario(NOW);
+  const fake = fakeOrca(demo);
+  try {
+    await writeScenario(home, demo);
+    const worker = await start(fake.orca, { home, now: () => NOW });
+    emit(fake, demo);
+    const all = await fake.panels.get('trace.snapshot')({});
+    assert.equal(all.project, '');
+    const other = all.workspaces.find((row) => row.id === 'ws-other').project;
+    const mine = all.workspaces.find((row) => row.id === 'ws-checkout').project;
+    assert.notEqual(other, mine);
+    assert.deepEqual(all.projects.map((item) => item.name).sort(), [mine, other].sort());
+    const only = await fake.panels.get('trace.snapshot')({ project: other });
+    assert.equal(only.project, other);
+    assert.deepEqual(only.workspaces.map((row) => row.id), ['ws-other']);
+    assert.ok(!only.snapshot.nodes.some((node) => node.id === 'w:ws-checkout'), 'other projects are left out');
+    const unknown = await fake.panels.get('trace.snapshot')({ project: 'no-such-project' });
+    assert.equal(unknown.project, '', 'an unknown project shows everything');
+    await worker.stop();
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});

@@ -9,6 +9,7 @@
   <body data-mode="panel">
     <div id="app">
       <header class="topbar">
+        <select id="project" aria-label="Project" hidden></select>
         <select id="ws" aria-label="Workspace"></select>
         <span id="branch" class="branch"></span>
         <span id="live" class="badge live" hidden>LIVE</span>
@@ -29,6 +30,7 @@
           <button class="tab" role="tab" id="tab-trace" aria-selected="true">Trace</button>
           <button class="tab" role="tab" id="tab-tokens" aria-selected="false">Tokens &amp; cost</button>
           <button class="tab" role="tab" id="tab-events" aria-selected="false">Events<span id="attn" class="count" title="Agents that need you or failed"></span></button>
+          <button class="tab" role="tab" id="tab-delivery" aria-selected="false" title="Pull requests, contributors and DORA metrics from GitHub">Delivery</button>
           <span id="zoom" class="zoom"><button id="zoom-out" title="Zoom out" aria-label="Zoom out">−</button><button id="zoom-in" title="Zoom in" aria-label="Zoom in">+</button></span>
           <span class="spacer"></span>
           <div id="totals" class="totals"></div>
@@ -36,6 +38,7 @@
         <div id="panel-trace" class="tabpanel" role="tabpanel"></div>
         <div id="panel-tokens" class="tabpanel" role="tabpanel" hidden></div>
         <div id="panel-events" class="tabpanel" role="tabpanel" hidden></div>
+        <div id="panel-delivery" class="tabpanel" role="tabpanel" hidden></div>
       </section>
     </div>
     <script type="module">

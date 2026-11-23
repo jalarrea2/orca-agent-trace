@@ -6,7 +6,16 @@ Agent Trace runs as an Orca **trusted worker** (Orca shows it as "Full access") 
 Claude Code and Codex transcript files from your home folder. It asks for four capabilities:
 `agent:read`, `workspace:read`, `storage:own` and `settings:own`.
 
-It is read-only and local: it writes no files, starts no processes and makes no network requests.
+It is read-only: it writes no files and starts no processes. It makes network requests only to the
+Agent Trace hubs listed in `~/.config/agent-trace/hubs.json`, and only when they are on your
+tailnet (https on a `*.ts.net` name, or a Tailscale address in 100.64.0.0/10), with a bearer token.
+With no such file it makes no network requests at all.
+
+The hub (`hub/`) runs on another Orca host as that host's user. Both of its listeners bind to
+127.0.0.1; the API is published to the tailnet with `tailscale serve` and every call needs the
+token. It reads that host's transcripts the same way the plugin does, keeps only numbers, names
+and ids from OpenTelemetry (no prompt text, tool input or output), and asks GitHub through the
+host's existing `gh` sign-in (it holds no GitHub token).
 The README's [Security and privacy](README.md#security-and-privacy) section says what is read,
 shown and stored.
 
@@ -31,7 +40,9 @@ saw, and a transcript line or event that reproduces it with anything private rem
 - Text from a transcript, an Orca event or a workspace name that runs as script or changes the
   page in the plugin's view.
 - The plugin reading or writing outside the transcript folders and its own storage, or reaching
-  the network.
+  any host other than a configured tailnet hub.
+- The hub answering without a valid token, listening beyond 127.0.0.1, or returning data outside
+  the transcripts, OpenTelemetry usage and GitHub statistics it is meant to serve.
 - A secret shown or stored that the masking described in the README should have caught.
 - A transcript or stored value that makes the worker hang, crash or use memory without bound.
 

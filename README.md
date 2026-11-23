@@ -30,7 +30,7 @@ lane per participant and one row per message, in order.
 Click a lane to keep only that agent's session. In the all-workspaces scope, tool calls start
 hidden so the agent-to-agent flow stands out, and a selector narrows to one workspace.
 
-It is read-only (it never sends anything to an agent) and local (no network requests).
+It is read-only (it never sends anything to an agent). Its only network use is an optional [Agent Trace hub](#remote-hosts-and-delivery-statistics) on your tailnet.
 
 Motion: running cards breathe and carry a sweeping light, connectors into a running agent flow
 (amber when it waits on you), running bars are striped and grow, and durations count up every
@@ -85,10 +85,36 @@ workspace sit side by side under it.
 | Claude Code folder | `~/.claude` | Folder that holds `projects/`. An absolute path, or one starting with `~`; anything else is ignored |
 | Codex folder | `~/.codex` | Folder that holds `sessions/`. Same rule |
 
+## Remote hosts and delivery statistics
+
+Agents that Orca runs on another host (an Orca server) write their transcripts there, out of the
+plugin's reach. An **Agent Trace hub** (`hub/server.mjs`, Node 22, no dependencies) on that host
+serves them to the plugin, and adds two things:
+
+- **OpenTelemetry**: an OTLP/HTTP JSON receiver for Claude Code and Codex. The cost an agent
+  reports itself shows next to the estimate in **Tokens & cost** ("reported").
+- **Delivery** tab: pull requests opened, merged and closed, contributors and lines merged over
+  the last 24 hours and 7 days, and the four DORA metrics with their performance band, per
+  project or for all of them. Lead time is pull request opened → merged; deploys are runs of the
+  repository's `deploy*.yml` workflow on `main` (or CI pushes to `main` when there is none);
+  change failure rate is failed / finished deploy runs; time to restore is a failed deploy run to
+  the next successful one. Projects are the checkouts in the hub host's `~/projects`, read through
+  its `gh` sign-in and refreshed every 5 minutes; `~/.config/agent-trace-hub/repos.json` overrides them.
+
+Setup (orca-cloud has the scripts): `server/agent-trace-hub/install.sh` on the host as its Orca
+user, `server/agent-trace-hub/tailscale-serve.sh` once with sudo to publish the API on the
+tailnet, then `scripts/agent-trace-pair.sh` on your computer, which writes
+`~/.config/agent-trace/hubs.json` (0600) without printing the token.
+
+The **project** selector in the top bar narrows every view, the Delivery tab included, to one
+Orca project (repository). Each workspace card and the totals show a progress bar: finished
+agents (done, failed, stopped) first, then the ones still running, needing you or waiting.
+
 ## Security and privacy
 
-- **Read-only and local.** The worker opens transcript files for reading and nothing else: it
-  writes no files, starts no processes and makes no network requests. The view frame has no
+- **Read-only.** The worker opens transcript files for reading and nothing else: it writes no
+  files and starts no processes. Its only network requests go to the hubs in
+  `~/.config/agent-trace/hubs.json`, which must be on your tailnet; without that file it makes none. The view frame has no
   network access (Orca denies it). There are no dependencies and no build step: what is in this
   repository is what runs.
 - **What is stored.** Only Orca's own events, in the plugin's private storage (`storage:own`), so

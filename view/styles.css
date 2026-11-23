@@ -316,3 +316,38 @@ button.lane-chip:hover { border-color: color-mix(in srgb, var(--primary) 50%, va
 }
 body.tiny .seg { order: 5; }
 body.tiny .check { font-size: 12px; }
+
+/* Progress: settled agents first (done, failed, stopped), then the ones still moving. */
+.progress { display: flex; height: 4px; margin-top: 7px; border-radius: 99px; overflow: hidden; background: var(--muted); gap: 1px; }
+.progress.wide { width: 90px; height: 6px; margin: 0 6px 0 0; flex: 0 0 auto; }
+.progress i { display: block; min-width: 3px; }
+.progress .p-done { background: var(--done); }
+.progress .p-failed { background: var(--failed); }
+.progress .p-stopped { background: color-mix(in srgb, var(--muted-fg) 55%, transparent); }
+.progress .p-running { background: repeating-linear-gradient(45deg, var(--running) 0 5px, color-mix(in srgb, var(--running) 60%, transparent) 5px 10px); background-size: 14.142px 100%; animation: stripes 1s linear infinite; animation-delay: var(--sync, 0s); }
+.progress .p-needs-you { background: var(--attention); }
+.progress .p-waiting, .progress .p-unknown { background: color-mix(in srgb, var(--muted-fg) 30%, transparent); }
+.totals-progress { display: inline-flex; align-items: center; }
+@media (prefers-reduced-motion: reduce) { .progress .p-running { animation: none; } }
+body.narrow .progress.wide { width: 56px; }
+
+/* Delivery: pull requests, contributors and DORA metrics. */
+.delivery { padding: 8px 10px 12px; }
+.delivery h3 { font-size: 12px; font-weight: 600; color: var(--muted-fg); text-transform: uppercase; letter-spacing: .04em; margin: 10px 0 6px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
+.tile { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 10px; }
+.t-label { color: var(--muted-fg); font-size: 12px; }
+.t-value { font-size: 20px; font-weight: 650; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.t-extra { color: var(--muted-fg); font-size: 12px; display: flex; gap: 6px; align-items: center; min-height: 18px; }
+.band { font-size: 11px; font-weight: 600; padding: 0 6px; border-radius: 99px; text-transform: capitalize; }
+.band.b-elite { color: var(--done); background: color-mix(in srgb, var(--done) 14%, transparent); }
+.band.b-high { color: var(--running); background: color-mix(in srgb, var(--running) 14%, transparent); }
+.band.b-medium { color: var(--attention); background: color-mix(in srgb, var(--attention) 14%, transparent); }
+.band.b-low { color: var(--failed); background: color-mix(in srgb, var(--failed) 14%, transparent); }
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-top: 12px; }
+table.stats { margin-top: 12px; font-variant-numeric: tabular-nums; }
+.stats-grid table.stats { margin-top: 0; }
+table.stats th, table.stats td { text-align: right; padding: 4px 6px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+table.stats .left { text-align: left; }
+.add { color: var(--done); }
+.del { color: var(--failed); }
