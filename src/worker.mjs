@@ -6,6 +6,7 @@ import { createLiveStore } from './core/live.mjs';
 import { requestCost } from './core/pricing.mjs';
 import { PRICES_AS_OF } from './core/prices-data.mjs';
 import { buildFleetSnapshot, buildSnapshot } from './core/snapshot.mjs';
+import { platform } from 'node:os';
 import { createHubClient } from './node/hubs.mjs';
 import { createTranscriptReader, resolveRoot } from './node/transcripts.mjs';
 
@@ -37,6 +38,11 @@ export async function deactivate() {
 }
 
 // Exported for tests: `orca` may be a stand-in, and `options` replaces the clock and home folder.
+// How the cards name the computer Orca runs on.
+export function localHostName(os = platform()) {
+  return os === 'darwin' ? 'This Mac' : os === 'win32' ? 'This PC' : 'This machine';
+}
+
 export async function start(orca, { now = () => Date.now(), home, persistMs = 5_000, notifyMs = 400, hubs: hubClient } = {}) {
   const live = createLiveStore();
   const warned = new Set();
@@ -195,11 +201,59 @@ export async function start(orca, { now = () => Date.now(), home, persistMs = 5_
   }
   // The project a workspace belongs to: Orca's repo name, else the workspace name.
   const projectOf = (row) => (typeof row.project === 'string' && row.project) || row.name || 'Other';
-  const workspaceOf = (row) => ({ id: row.id, name: row.name, branch: [row.project && row.project !== row.name ? row.project : '', row.branch ?? ''].filter(Boolean).join(' · ') });
+  const workspaceOf = (row, hosts) => ({
+    id: row.id,
+    name: row.name,
+    branch: [row.project && row.project !== row.name ? row.project : '', row.branch ?? ''].filter(Boolean).join(' · '),
+    host: hosts?.get(row.hostId ?? 'local') ?? null,
+  });
+
+  // Where each workspace runs, keyed by Orca's hostId (`local`, `ssh:<alias>`, `runtime:<environment id>`).
+  // A remote host takes the name of the Agent Trace hub paired with it (hubs.json), else a short
+  // form of its id: Orca's plugin API does not expose environment names.
+  // Workspaces of paired Orca servers: this Mac's Orca does not list them, so each hub says which
+  // of its workspaces had agent activity. A row Orca already lists (same host and folder) wins.
+  async function hubRows(rows, since, notices) {
+    const known = new Set(rows.map((row) => `${row.hostId ?? 'local'}|${row.path}`));
+    const out = [];
+    for (const hub of await hubs.all()) {
+      const answer = await hubs.workspaces(hub, since);
+      if (answer.error) {
+        notices.push(`Remote workspaces unavailable: ${answer.error}.`);
+        continue;
+      }
+      const hostId = hub.hostIds[0] ? `runtime:${hub.hostIds[0]}` : `hub:${hub.name}`;
+      for (const item of answer.workspaces) {
+        if (known.has(`${hostId}|${item.path}`) || known.has(`${hub.hostIds[0]}|${item.path}`)) continue;
+        known.add(`${hostId}|${item.path}`);
+        out.push({
+          id: `remote:${hub.name}:${item.path}`, kind: 'worktree', name: String(item.name || item.path.split('/').pop()),
+          project: typeof item.project === 'string' && item.project ? item.project : null,
+          path: item.path, branch: typeof item.branch === 'string' ? item.branch : '', hostId,
+        });
+      }
+    }
+    return out;
+  }
+
+  async function hostsFor(rows) {
+    const hosts = new Map();
+    for (const hostId of new Set(rows.map((row) => row.hostId ?? 'local'))) {
+      if (isLocal({ hostId })) {
+        hosts.set(hostId, { id: 'local', name: localHostName(), local: true });
+        continue;
+      }
+      const bare = hostId.replace(/^(runtime|ssh):/, '');
+      const hub = (await hubs.hubFor(hostId)) ?? (bare !== hostId ? await hubs.hubFor(bare) : null);
+      const name = hub?.name || (hostId.startsWith('ssh:') ? bare : `remote ${bare.slice(0, 8)}`);
+      hosts.set(hostId, { id: hostId, name, local: false });
+    }
+    return hosts;
+  }
 
   async function fleet(rows, focusedRow, at, since, notices, project = '') {
     const local = rows.filter(isLocal);
-    const [byCwd, remote] = await Promise.all([reader.sessionsForMany(local.map((row) => row.path), since), remoteSessions(rows, since, notices)]);
+    const [byCwd, remote, hosts] = await Promise.all([reader.sessionsForMany(local.map((row) => row.path), since), remoteSessions(rows, since, notices), hostsFor(rows)]);
     const panesOf = new Map();
     const orphans = [];
     for (const pane of live.panes()) {
@@ -214,7 +268,7 @@ export async function start(orca, { now = () => Date.now(), home, persistMs = 5_
       const mine = !taken.has(place);
       if (mine) taken.add(place);
       return {
-        workspace: workspaceOf(row),
+        workspace: workspaceOf(row, hosts),
         sessions: !mine ? [] : isLocal(row) ? byCwd.get(row.path) ?? [] : remote.get(row) ?? [],
         panes: panesOf.get(row.id) ?? [],
         busy: row.status?.state === 'working' || row.status?.state === 'permission',
@@ -235,7 +289,8 @@ export async function start(orca, { now = () => Date.now(), home, persistMs = 5_
     const notices = [];
 
     context = (await call('workspace.readContext')) ?? context;
-    const allRows = await listWorkspaces();
+    const allRows = [...(await listWorkspaces())];
+    allRows.push(...(await hubRows(allRows, since, notices)));
     const projectCounts = new Map();
     for (const item of allRows) projectCounts.set(projectOf(item), (projectCounts.get(projectOf(item)) ?? 0) + 1);
     const project = typeof input?.project === 'string' && projectCounts.has(input.project) ? input.project : '';
@@ -261,7 +316,7 @@ export async function start(orca, { now = () => Date.now(), home, persistMs = 5_
       let panes = [];
       let sessions = [];
       if (row) {
-        workspace = workspaceOf(row);
+        workspace = workspaceOf(row, await hostsFor([row]));
         panes = live.panes().filter((pane) => rowOfPane(pane, rows, focusedRow)?.id === row.id);
         if (!isLocal(row)) {
           const found = (await remoteSessions([row], since, notices)).get(row);
@@ -374,7 +429,7 @@ export async function start(orca, { now = () => Date.now(), home, persistMs = 5_
   on(() => orca.panels?.handle('trace.stats', async (input) => {
     const project = typeof input?.project === 'string' ? input.project.slice(0, 100) : '';
     const hub = await hubs.anyHub();
-    if (!hub) return { stats: null, notice: 'Delivery statistics need an Agent Trace hub: run scripts/agent-trace-pair.sh from orca-cloud.' };
+    if (!hub) return { stats: null, notice: 'Delivery statistics need an Agent Trace hub: see "Remote hosts" in the plugin README (hub/install.sh, then scripts/pair.sh).' };
     const answer = await hubs.stats(hub, project);
     return answer.error ? { stats: null, notice: `Delivery statistics unavailable: ${answer.error}.` } : { stats: answer.stats, hub: answer.hub };
   }));

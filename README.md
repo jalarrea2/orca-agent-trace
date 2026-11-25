@@ -45,7 +45,7 @@ It shows up in two places:
 
 ## Status
 
-Early: version 0.3, used on one machine so far. Expect rough edges, and please open an issue with
+Early: version 0.4, used on one setup so far. Expect rough edges, and please open an issue with
 what you see.
 
 ## Install
@@ -88,8 +88,11 @@ workspace sit side by side under it.
 ## Remote hosts and delivery statistics
 
 Agents that Orca runs on another host (an Orca server) write their transcripts there, out of the
-plugin's reach. An **Agent Trace hub** (`hub/server.mjs`, Node 22, no dependencies) on that host
-serves them to the plugin, and adds two things:
+plugin's reach, and your computer's Orca does not list a paired server's workspaces to plugins. An
+**Agent Trace hub** (`hub/server.mjs`, Node 22, no dependencies) on that host serves both to the
+plugin: the workspaces under the server's Orca workspaces root (`~/orca/workspaces/<project>/<workspace>`,
+or `AGENT_TRACE_WORKSPACES`) that had agent activity, and their transcripts. They appear in the tree
+as remote groups, inside the same project filter as your local workspaces. It also adds two things:
 
 - **OpenTelemetry**: an OTLP/HTTP JSON receiver for Claude Code and Codex. The cost an agent
   reports itself shows next to the estimate in **Tokens & cost** ("reported").
@@ -101,10 +104,27 @@ serves them to the plugin, and adds two things:
   the next successful one. Projects are the checkouts in the hub host's `~/projects`, read through
   its `gh` sign-in and refreshed every 5 minutes; `~/.config/agent-trace-hub/repos.json` overrides them.
 
-Setup (orca-cloud has the scripts): `server/agent-trace-hub/install.sh` on the host as its Orca
-user, `server/agent-trace-hub/tailscale-serve.sh` once with sudo to publish the API on the
-tailnet, then `scripts/agent-trace-pair.sh` on your computer, which writes
-`~/.config/agent-trace/hubs.json` (0600) without printing the token.
+Every workspace and agent card says where it runs: **⌂ This Mac** (This PC, This machine) for
+your computer, **☁ <name>** for a remote host, named after its hub in `hubs.json` (an SSH host
+without a hub is named by its alias).
+
+### Setting up a hub
+
+Requirements: the server runs Linux with systemd, Node 22+, `jq` and `git`; the server and your
+computer are on the same [Tailscale](https://tailscale.com) tailnet with HTTPS certificates enabled.
+The plugin only talks to `https://*.ts.net` names or Tailscale addresses (100.64.0.0/10): the hub
+serves your transcripts and its token is the only other lock, so it is never offered on a public
+address.
+
+1. On the server, as the user that runs Orca (no sudo), from a checkout of this repository:
+   `bash hub/install.sh`. It installs the hub as a systemd user service on 127.0.0.1, creates its
+   token, and points Claude Code and Codex OpenTelemetry at it (`AGENT_CONFIG=0` skips that).
+2. On the server, once, as a user with sudo: `bash hub/tailscale-serve.sh`. It publishes the API to
+   the tailnet only, on port 8443.
+3. On your computer: `scripts/pair.sh <ssh-host> [orca-environment-id] [server-orca-user]`. It
+   finds the Orca environment id with `orca environment list` when you leave it out, and writes
+   `~/.config/agent-trace/hubs.json` (0600) without printing the token. Pass the server's Orca user
+   when it differs from your SSH user.
 
 The **project** selector in the top bar narrows every view, the Delivery tab included, to one
 Orca project (repository). Each workspace card and the totals show a progress bar: finished

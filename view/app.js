@@ -300,6 +300,14 @@ function durationHtml(node, prefix = '') {
   return `${esc(prefix)}${fmtDuration(Math.max(0, node.endedAt - node.startedAt))}`;
 }
 
+// Where a workspace or agent runs: this Mac, or a remote Orca host such as orca-server. Subagents
+// run where their parent does, so only the tooltip names it there.
+function hostChip(node) {
+  if (!node.host || node.kind === 'fleet' || node.kind === 'subagent') return '';
+  const remote = node.host.local !== true;
+  return `<span class="host${remote ? ' remote' : ''}" title="Runs on ${esc(node.host.name)}${remote ? ' (remote Orca host)' : ''}"><span aria-hidden="true">${remote ? '☁' : '⌂'}</span>${esc(node.host.name)}</span>`;
+}
+
 function cardHtml(node, snapshot) {
   const cost = node.total.cost === null ? '' : `<span class="cost" title="Estimated cost${node.total.costPartial ? ', incomplete: some models have no price' : ''}">${fmtCost(node.total.cost)}${node.total.costPartial ? '+' : ''}</span>`;
   const tokens = node.total.tokens ? `${fmtTokens(node.total.tokens)} tok` : '';
@@ -313,8 +321,8 @@ function cardHtml(node, snapshot) {
   if (state.fresh.has(node.id)) classes.push('enter');
   if (state.turned.has(node.id)) classes.push('turned');
   return `<div class="card-wrap">
-    <div class="tag">${esc(node.group)}</div>
-    <button class="${classes.join(' ')}" data-id="${esc(node.id)}" title="${esc(node.name)}${node.task ? ` — ${esc(node.task)}` : ''}${tokens ? `\n${tokens}` : ''}">
+    <div class="tags"><span class="tag">${esc(node.group)}</span>${hostChip(node)}</div>
+    <button class="${classes.join(' ')}" data-id="${esc(node.id)}" title="${esc(node.name)}${node.task ? ` — ${esc(node.task)}` : ''}${node.host ? `\nRuns on ${esc(node.host.name)}` : ''}${tokens ? `\n${tokens}` : ''}">
       <div class="row1">${glyph(node)}<span class="name">${esc(node.name)}</span>${pill(node.state)}</div>
       <div class="task">${esc(task)}</div>
       ${group && progressOf(snapshot).get(node.id) ? progressBar(progressOf(snapshot).get(node.id)) : ''}

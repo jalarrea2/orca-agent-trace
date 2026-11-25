@@ -11,8 +11,9 @@
 //   AGENT_TRACE_OTLP_PORT      OTLP receiver port  (default 4318)
 //   AGENT_TRACE_HUB_TOKEN_FILE bearer token file   (default ~/.config/agent-trace-hub/token)
 //   AGENT_TRACE_HUB_STATE_DIR  persisted OTel rows (default ~/.local/state/agent-trace-hub)
+//   AGENT_TRACE_WORKSPACES     Orca workspaces root, <root>/<project>/<workspace> (default ~/orca/workspaces)
 import { timingSafeEqual } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -50,6 +51,30 @@ function sameToken(given, expected) {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+async function dirs(path) {
+  try {
+    return (await readdir(path, { withFileTypes: true })).filter((entry) => entry.isDirectory() && !entry.name.startsWith('.')).map((entry) => entry.name).sort();
+  } catch {
+    return [];
+  }
+}
+
+// The checked-out branch of a worktree or repository folder, or '' when it cannot be read.
+async function branchOf(path) {
+  try {
+    let gitDir = join(path, '.git');
+    if (!(await stat(gitDir)).isDirectory()) {
+      const pointer = (await readFile(gitDir, 'utf8')).match(/^gitdir:\s*(.+)$/m)?.[1]?.trim();
+      if (!pointer) return '';
+      gitDir = pointer.startsWith('/') ? pointer : join(path, pointer);
+    }
+    const head = (await readFile(join(gitDir, 'HEAD'), 'utf8')).trim();
+    return head.startsWith('ref: refs/heads/') ? head.slice(16) : '';
+  } catch {
+    return '';
+  }
+}
+
 // Adds the agent-reported usage to each transcript session that OpenTelemetry also saw.
 export function withOtel(sessions, otel) {
   return sessions.map((session) => {
@@ -58,12 +83,13 @@ export function withOtel(sessions, otel) {
   });
 }
 
-export function createHub({ token, home = homedir(), now = () => Date.now(), stateDir, github } = {}) {
+export function createHub({ token, home = homedir(), now = () => Date.now(), stateDir, github, workspacesRoot } = {}) {
   if (!token || String(token).length < 24) throw new Error('a token of at least 24 characters is required');
   const otel = createOtelStore({ now });
   const reader = createTranscriptReader({ home, cost: requestCost, now });
   const delivery = github ?? createGithubStats({ home, now, log: (message) => console.error(message) });
   const statePath = stateDir ? join(stateDir, 'otel.json') : null;
+  const root = workspacesRoot ?? join(home, 'orca/workspaces');
   let dirty = false;
 
   async function load() {
@@ -131,7 +157,31 @@ export function createHub({ token, home = homedir(), now = () => Date.now(), sta
       for (const [cwd, list] of byCwd) out[cwd] = withOtel(list, otel);
       return send(res, 200, { version: HUB_VERSION, generatedAt: now(), byCwd: out });
     }
+    if (req.method === 'GET' && url.pathname === '/v1/workspaces') {
+      const since = Math.max(now() - MAX_RANGE_MS, Number(url.searchParams.get('since')) || now() - 3_600_000);
+      return send(res, 200, { version: HUB_VERSION, generatedAt: now(), workspaces: await activeWorkspaces(since) });
+    }
     return send(res, 404, { error: 'not found' });
+  }
+
+  // The Orca workspaces on this host (<root>/<project>/<workspace>) with agent activity since
+  // `since`. The plugin's own Orca does not list a paired server's workspaces, so it asks here.
+  async function activeWorkspaces(since) {
+    const paths = [];
+    for (const project of await dirs(root)) {
+      for (const name of await dirs(join(root, project))) {
+        if (paths.length < MAX_PATHS) paths.push({ path: join(root, project, name), project, name });
+      }
+    }
+    const byCwd = await reader.sessionsForMany(paths.map((item) => item.path), since);
+    const out = [];
+    for (const item of paths) {
+      const sessions = byCwd.get(item.path) ?? [];
+      const lastAt = Math.max(0, ...sessions.flatMap((session) => session.agents.map((agent) => agent.lastAt ?? 0)));
+      if (!sessions.length || lastAt < since) continue;
+      out.push({ ...item, branch: await branchOf(item.path), lastAt });
+    }
+    return out.sort((a, b) => b.lastAt - a.lastAt);
   }
 
   return { otel, delivery, load, persist, otlp, api };
@@ -142,7 +192,7 @@ async function main() {
   const tokenFile = process.env.AGENT_TRACE_HUB_TOKEN_FILE || join(home, '.config/agent-trace-hub/token');
   const token = (await readFile(tokenFile, 'utf8')).trim();
   const stateDir = process.env.AGENT_TRACE_HUB_STATE_DIR || join(home, '.local/state/agent-trace-hub');
-  const hub = createHub({ token, home, stateDir });
+  const hub = createHub({ token, home, stateDir, workspacesRoot: process.env.AGENT_TRACE_WORKSPACES || undefined });
   await hub.load();
   hub.delivery.start();
   const apiPort = Number(process.env.AGENT_TRACE_HUB_PORT || 7787);
