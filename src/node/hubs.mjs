@@ -13,6 +13,7 @@ import { join } from 'node:path';
 
 const TIMEOUT_MS = 6000;
 const CACHE_MS = 2500;
+const WORKSPACES_CACHE_MS = 15_000;
 const RELOAD_MS = 10_000;
 
 export function allowedHubUrl(raw) {
@@ -68,9 +69,37 @@ export function createHubClient({ home = homedir(), file, fetchImpl = globalThis
   }
 
   return {
+    // Orca names a paired server's rows `runtime:<environment id>`; hubs.json lists the bare id.
     async hubFor(hostId) {
       if (!hostId) return null;
-      return (await load()).find((hub) => hub.allowed && hub.hostIds.includes(hostId)) ?? null;
+      const bare = String(hostId).replace(/^runtime:/, '');
+      return (await load()).find((hub) => hub.allowed && (hub.hostIds.includes(hostId) || hub.hostIds.includes(bare))) ?? null;
+    },
+    // Every hub that can be asked.
+    async all() {
+      return (await load()).filter((hub) => hub.allowed);
+    },
+    // The active Orca workspaces on the hub's host, or { error } when the hub could not answer.
+    async workspaces(hub, since) {
+      const key = `ws|${hub.url}|${Math.floor(since / 60_000)}`;
+      const hit = cache.get(key);
+      if (hit && now() - hit.at < WORKSPACES_CACHE_MS) return hit.result;
+      let result;
+      try {
+        const res = await fetchImpl(`${hub.url}/v1/workspaces?since=${Math.floor(since)}`, {
+          headers: { authorization: `Bearer ${hub.token}` },
+          signal: AbortSignal.timeout(TIMEOUT_MS),
+          redirect: 'error',
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const body = await res.json();
+        const list = Array.isArray(body?.workspaces) ? body.workspaces : [];
+        result = { workspaces: list.filter((item) => item && typeof item.path === 'string' && item.path.startsWith('/')) };
+      } catch (error) {
+        result = { error: `${hub.name} did not answer (${error?.name === 'TimeoutError' ? 'timeout' : error?.message ?? error})` };
+      }
+      cache.set(key, { at: now(), result });
+      return result;
     },
     // Any hub that can be asked (delivery statistics are not tied to a host).
     async anyHub() {
@@ -110,7 +139,7 @@ export function createHubClient({ home = homedir(), file, fetchImpl = globalThis
       } catch (error) {
         result = { error: `${hub.name} did not answer (${error?.name === 'TimeoutError' ? 'timeout' : error?.message ?? error})` };
       }
-      for (const [old, entry] of cache) if (now() - entry.at >= CACHE_MS) cache.delete(old);
+      for (const [old, entry] of cache) if (now() - entry.at >= (old.startsWith('ws|') ? WORKSPACES_CACHE_MS : CACHE_MS)) cache.delete(old);
       cache.set(key, { at: now(), result });
       return result;
     },

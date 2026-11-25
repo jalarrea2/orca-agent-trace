@@ -90,6 +90,10 @@ button, select { font: inherit; color: inherit; }
 .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 1 1 auto; }
 .task { color: var(--muted-fg); margin: 5px 0 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .task:empty { display: none; }
+.tags { display: flex; align-items: center; gap: 4px; min-width: 0; margin-bottom: 4px; }
+.tags .tag { margin-bottom: 0; flex: 0 1 auto; }
+.host { display: inline-flex; align-items: center; gap: 3px; flex: 0 1 auto; min-width: 0; font-size: 9.5px; letter-spacing: .04em; color: var(--muted-fg); border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.host.remote { color: var(--fg); border-color: color-mix(in srgb, var(--fg) 30%, var(--line)); }
 .meta { margin-top: 7px; display: flex; align-items: center; gap: 6px; background: var(--muted); border-radius: 7px; padding: 4px 7px; color: var(--muted-fg); font-size: 12px; }
 .meta .model { flex: 1 1 auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .meta .cost { color: var(--fg); font-weight: 600; white-space: nowrap; }

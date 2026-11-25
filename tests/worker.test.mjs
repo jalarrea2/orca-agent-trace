@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { claudeProjectDirNames } from '../src/node/transcripts.mjs';
-import { start } from '../src/worker.mjs';
+import { localHostName, start } from '../src/worker.mjs';
 import { claude, demoScenario } from './fixtures.mjs';
 
 // A stand-in for the `orca` object a worker gets, backed by the demo scenario.
@@ -189,6 +189,81 @@ test('worker: filters the fleet by project and lists the projects', async () => 
     assert.ok(!only.snapshot.nodes.some((node) => node.id === 'w:ws-checkout'), 'other projects are left out');
     const unknown = await fake.panels.get('trace.snapshot')({ project: 'no-such-project' });
     assert.equal(unknown.project, '', 'an unknown project shows everything');
+    await worker.stop();
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('worker: every card says where its workspace runs (this Mac or the paired remote host)', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agent-trace-'));
+  const NOW = Date.now();
+  const demo = demoScenario(NOW);
+  const fake = fakeOrca(demo);
+  const remoteRow = { id: 'ws-remote', kind: 'worktree', name: 'remote-ws', path: '/home/orca/work', branch: 'main', hostId: 'runtime:env-123456789' };
+  const sshRow = { id: 'ws-ssh', kind: 'worktree', name: 'ssh-ws', path: '/srv/x', branch: 'main', hostId: 'ssh:buildbox' };
+  const call = fake.orca.host.call;
+  fake.orca.host.call = async (method, params) => {
+    const answer = await call(method, params);
+    return method === 'workspace.list' ? { ...answer, workspaces: [...answer.workspaces, { ...remoteRow, status: { state: 'working', unread: false, terminalCount: 1, lastActivityAt: NOW } }, sshRow] } : answer;
+  };
+  const hubs = {
+    hubFor: async (hostId) => (hostId === 'env-123456789' ? { name: 'orca-server' } : null),
+    anyHub: async () => null,
+    all: async () => [],
+    sessions: async () => ({ byCwd: new Map() }),
+  };
+  try {
+    await writeScenario(home, demo);
+    const worker = await start(fake.orca, { home, now: () => NOW, hubs });
+    emit(fake, demo);
+    const fleet = (await fake.panels.get('trace.snapshot')({})).snapshot;
+    const local = fleet.nodes.find((node) => node.id === 'w:ws-checkout');
+    assert.deepEqual(local.host, { id: 'local', name: localHostName(), local: true });
+    assert.deepEqual(['darwin', 'win32', 'linux'].map((os) => localHostName(os)), ['This Mac', 'This PC', 'This machine']);
+    const agents = fleet.nodes.filter((node) => node.parentId === 'w:ws-checkout');
+    assert.ok(agents.length > 0 && agents.every((node) => node.host?.name === localHostName()), 'agents inherit the workspace host');
+    const remote = fleet.nodes.find((node) => node.id === 'w:ws-remote');
+    assert.deepEqual(remote.host, { id: 'runtime:env-123456789', name: 'orca-server', local: false }, 'a runtime host takes its paired hub name');
+
+    const one = (await fake.panels.get('trace.snapshot')({ workspaceId: 'ws-ssh' })).snapshot;
+    assert.equal(one.workspace.host.name, 'buildbox', 'an ssh host is named by its alias');
+    assert.equal(one.nodes[0].host.local, false);
+    await worker.stop();
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('worker: a paired server\'s active workspaces show up as remote groups named after its hub', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agent-trace-'));
+  const NOW = Date.now();
+  const demo = demoScenario(NOW);
+  const fake = fakeOrca(demo);
+  const path = '/home/orca/orca/workspaces/kyc/kyc-coordinator';
+  const hub = { name: 'orca-server', hostIds: ['3e50230a'], url: 'https://orca-server.x.ts.net:8443', token: 't', allowed: true };
+  const session = {
+    sessionId: 'remote-1', agentKind: 'claude', cwd: path, events: [], prompts: [], orch: [], inboundIds: [],
+    agents: [{ key: '', parentKey: null, name: 'Orca coordinator (kyc)', type: '', model: 'claude-opus-5-5', firstAt: NOW - 120_000, lastAt: NOW - 5_000, usage: { input: 10, output: 20, cacheRead: 0, cacheWrite: 0 }, cost: 0.01, unpriced: false, requests: 1, toolCount: 0, errorCount: 0, spans: [], open: true }],
+  };
+  const hubs = {
+    hubFor: async (hostId) => (String(hostId).replace(/^runtime:/, '') === '3e50230a' ? hub : null),
+    anyHub: async () => hub,
+    all: async () => [hub],
+    workspaces: async () => ({ workspaces: [{ path, project: 'kyc', name: 'kyc-coordinator', branch: 'main', lastAt: NOW - 5_000 }] }),
+    sessions: async (_hub, paths) => ({ byCwd: new Map(paths.map((p) => [p, p === path ? [session] : []])) }),
+  };
+  try {
+    await writeScenario(home, demo);
+    const worker = await start(fake.orca, { home, now: () => NOW, hubs });
+    emit(fake, demo);
+    const answer = await fake.panels.get('trace.snapshot')({});
+    const group = answer.snapshot.nodes.find((node) => node.id === `w:remote:orca-server:${path}`);
+    assert.ok(group, 'the remote workspace is in the fleet');
+    assert.deepEqual(group.host, { id: 'runtime:3e50230a', name: 'orca-server', local: false });
+    const agent = answer.snapshot.nodes.find((node) => node.id === 's:remote-1');
+    assert.equal(agent.host.name, 'orca-server');
+    assert.ok(answer.projects.some((item) => item.name === 'kyc'), 'it joins the kyc project filter');
     await worker.stop();
   } finally {
     await rm(home, { recursive: true, force: true });

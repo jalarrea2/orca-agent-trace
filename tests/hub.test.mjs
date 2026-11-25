@@ -91,6 +91,26 @@ test('hub: OTLP JSON receiver and token-protected sessions API with OTel usage a
     const [session] = answer.body.byCwd[cwd];
     assert.equal(session.sessionId, 'sess-r');
     assert.equal(session.otel.costUsd, 1.5);
+
+    const root = join(home, 'orca', 'workspaces');
+    await mkdir(join(root, 'demo', 'w1'), { recursive: true });
+    await mkdir(join(root, 'demo', 'idle'), { recursive: true });
+    await writeFile(join(root, 'demo', 'w1', '.git'), 'gitdir: ../.bare/worktrees/w1\n');
+    await mkdir(join(root, 'demo', '.bare', 'worktrees', 'w1'), { recursive: true });
+    await writeFile(join(root, 'demo', '.bare', 'worktrees', 'w1', 'HEAD'), 'ref: refs/heads/feat/x\n');
+    const w1 = join(root, 'demo', 'w1');
+    const w1Dir = join(home, '.claude', 'projects', claudeProjectDirNames(w1)[0]);
+    await mkdir(w1Dir, { recursive: true });
+    await writeFile(join(w1Dir, 'sess-w.jsonl'), [
+      claude.user(now - 60_000, 'Review the PR', { cwd: w1, sessionId: 'sess-w' }),
+      claude.assistant(now - 50_000, { id: 'm2' }, { cwd: w1, sessionId: 'sess-w' }),
+    ].join('\n') + '\n');
+    const hubWs = createHub({ token: TOKEN, home, now: () => now, workspacesRoot: root });
+    assert.equal((await call(hubWs.api, { url: '/v1/workspaces' })).status, 401);
+    const listed = await call(hubWs.api, { url: `/v1/workspaces?since=${now - 3_600_000}`, headers: { authorization: `Bearer ${TOKEN}` } });
+    assert.equal(listed.status, 200);
+    assert.equal(listed.body.workspaces.length, 1, 'only workspaces with agent activity are listed');
+    assert.deepEqual({ ...listed.body.workspaces[0], lastAt: 0 }, { path: w1, project: 'demo', name: 'w1', branch: 'feat/x', lastAt: 0 });
   } finally {
     await rm(home, { recursive: true, force: true });
   }

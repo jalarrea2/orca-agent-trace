@@ -27,7 +27,7 @@ export function agentLabel(kind) {
   return Object.hasOwn(AGENT_LABELS, kind) ? AGENT_LABELS[kind] : kind.charAt(0).toUpperCase() + kind.slice(1);
 }
 
-// workspace: { id, name, branch } | null
+// workspace: { id, name, branch, host? } | null; host is { id, name, local } (where it runs)
 // sessions:  results of the transcript adapters (see adapters/claude.mjs)
 // panes:     live panes of this workspace (see live.mjs)
 export function buildSnapshot({ workspace = null, sessions = [], panes = [], now = Date.now(), since = 0, notices = [], pricesAsOf = '' } = {}) {
@@ -35,7 +35,7 @@ export function buildSnapshot({ workspace = null, sessions = [], panes = [], now
   return finish({ scope: 'workspace', nodes: part.nodes, spans: part.spans, events: part.events, flows: [part.flows], workspace, workspaces: 1, now, since, notices, pricesAsOf });
 }
 
-// groups: [{ workspace: { id, name, branch }, sessions, panes, busy? }] for every workspace Orca
+// groups: [{ workspace: { id, name, branch, host? }, sessions, panes, busy? }] for every workspace Orca
 // lists; `busy` is true when Orca itself says an agent is working or waiting on the person there.
 // Only workspaces that are active make it into the tree: an agent running or needing the person,
 // or any agent activity since `activeSince`.
@@ -85,9 +85,11 @@ function collectWorkspace({ workspace, sessions = [], panes = [], now, since, id
   const paneOf = matchPanes(live, recentPanes);
   const matchedPanes = new Set(paneOf.values());
 
+  // Where the workspace runs (this Mac, or a remote Orca host): every agent card under it says so.
+  const host = hostOf(workspace);
   const top = node({
     id, parentId, depth, kind: 'workspace', group: 'Workspace',
-    name: workspace?.name || 'Workspace', task: workspace?.branch || '', source: 'orca',
+    name: workspace?.name || 'Workspace', task: workspace?.branch || '', source: 'orca', host,
   });
   nodes.push(top);
 
@@ -110,6 +112,7 @@ function collectWorkspace({ workspace, sessions = [], panes = [], now, since, id
         task: isMain ? pane?.task || (pane?.title && agent.name !== 'Session' ? agent.name : '') : '',
         model: agent.model,
         state,
+        host,
         source: 'transcript',
         live: isMain && pane !== null,
         startedAt: agent.firstAt,
@@ -151,7 +154,7 @@ function collectWorkspace({ workspace, sessions = [], panes = [], now, since, id
     const state = paneState(pane);
     const item = node({
       id: `p:${pane.key}`, parentId: id, depth: depth + 1, kind: 'agent', group: agentLabel(pane.agent), agent: pane.agent,
-      name: pane.title || pane.task || agentLabel(pane.agent), task: pane.title ? pane.task : '', state, source: 'events', live: true,
+      name: pane.title || pane.task || agentLabel(pane.agent), task: pane.title ? pane.task : '', state, source: 'events', live: true, host,
       startedAt: pane.firstAt, endedAt: ACTIVE.has(state) ? null : pane.lastAt, lastAt: pane.lastAt ?? 0, toolCount: pane.tools.length,
     });
     nodes.push(item);
@@ -191,7 +194,7 @@ function finish({ scope, nodes, spans, events, flows = [], workspace, workspaces
     generatedAt: now,
     since,
     scope,
-    workspace: workspace ? { id: workspace.id, name: workspace.name, branch: workspace.branch || '' } : null,
+    workspace: workspace ? { id: workspace.id, name: workspace.name, branch: workspace.branch || '', host: hostOf(workspace) } : null,
     live,
     range: { start, end },
     totals: {
@@ -295,9 +298,16 @@ function resolveMessages(flows, known, since) {
 function node(fields) {
   return {
     id: '', parentId: null, depth: 0, kind: 'agent', group: '', agent: '', name: '', task: '', model: '', state: 'done',
-    source: 'transcript', live: false, startedAt: null, endedAt: null, lastAt: 0, tokens: null, cost: null, costPartial: false,
+    source: 'transcript', live: false, host: null, startedAt: null, endedAt: null, lastAt: 0, tokens: null, cost: null, costPartial: false,
     requests: 0, toolCount: 0, errorCount: 0, agentCount: 0, total: { tokens: 0, cost: null, costPartial: false }, ...fields,
   };
+}
+
+// A workspace's host as { id, name, local }, or null when Orca did not say where it runs.
+function hostOf(workspace) {
+  const host = workspace?.host;
+  if (!host || typeof host.name !== 'string' || !host.name) return null;
+  return { id: String(host.id ?? ''), name: host.name, local: host.local === true };
 }
 
 function mainOf(session) {
